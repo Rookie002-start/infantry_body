@@ -1,0 +1,39 @@
+/**
+ * @file from_head.hpp
+ * @author qingyu
+ * @brief 上板→下板接收数据契约（topic 层：只定义结构体与通道，不含业务逻辑）
+ *
+ * 状态通道（zbus pub_from_head）：level 语义，保留最新值，供多个消费者各自读取。
+ * （下板不使用命令帧，故此处没有命令队列）
+ *
+ * @version 0.1
+ * @date 2026-09-14
+ *
+ * @copyright Copyright (c) 2026
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <zephyr/kernel.h>
+#include <zephyr/zbus/zbus.h>
+#include "inter_cmd.hpp"      // 复用共享协议结构体与布局常量
+
+namespace topic::from_head
+{
+    /// 状态帧契约（zbus 通道：消费者用 zbus_chan_read 轮询最新值）
+    struct Message
+    {
+        inter_cmd::CommState    comm{};    // 底盘速度指令 / 云台角度指令
+        inter_cmd::AutoAimState autoaim{};
+        inter_cmd::ImuState     imu{};
+
+        /// 超时判定结果。false = 上板数据已失效（上电初值为 false）
+        ///  消费者必须先检查该标志，不要直接使用陈旧字段
+        bool     online{};
+        /// 该帧年龄（ms），供消费者使用比接收侧更细的超时阈值
+        uint16_t age_ms{};
+    };
+}
+
+ZBUS_CHAN_DECLARE(pub_from_head);

@@ -1,0 +1,396 @@
+/**
+ * @file trd_chassis.cpp
+ * @author qingyu
+ * @brief 底盘控制线程 — 1ms 固定周期：指令 → 坐标变换 → 麦轮逆解 → 速度环 → 组帧
+ * @version 0.3
+ * @date 2026-09-15
+ *
+ * ## 坐标系（右手系，z 轴向上）
+ *
+ *       +x (前)
+ *        ↑
+ *        |
+ *        O────→ +y (左)
+ *
+ * 自转 ω 绕 z 轴，逆时针为正。
+ *
+ * ## 数据来源与所有权
+ *
+ * | 数据 | 通道 / 段 | 生产者 | 本线程的角色 |
+ * |------|-----------|--------|--------------|
+ * | 上板指令 | zbus `pub_from_head` | thread/inter_rx | 轮询读（状态通道无订阅者） |
+ * | 云台相对角 | zbus `pub_gimbal_to` | 云台线程（尚未接入） | 轮询读，缺数据按 0 处理 |
+ * | 电机反馈 | `.can_rx1` 段 | thread/can 的收帧分发 | 只注册 CAN_RX_HANDLER |
+ * | 控制电流 | k_msgq `user_can1_msgq` | 本线程 | 入队，由 thread/can 发送 |
+ *
+ * ## 控制流
+ *
+ *     ReadCommand()       上板指令 + online 判定（离线 → 停车）
+ *         ↓
+ *     ReadGimbalYaw()     云台相对底盘偏航角
+ *         ↓
+ *     UpdateTarget()      云台系 → 底盘系旋转 + 麦轮逆解 + 限幅
+ *         ↓
+ *     ControlCalculate()  单轮双环 PID（外环 ω → 内环 τ → 电流）
+ *         ↓
+ *     FramePublish()      4 × int16 组帧 → CAN 发送队列
+ *
+ * ## 双环结构（每个电机一组）
+ *
+ *     目标轮速 ω_ref ──→ ⊖ ──→ [外环 速度 PID] ──→ τ_ref ──→ ⊖ ──→ [内环 力矩 PID] ──→ /kTorqueK ──→ 电流
+ *                       ↑                                  ↑
+ *                    实测 ω                              实测 τ
+ *
+ *   外环输出是"力矩给定"（N·m），内环闭环在电调回传的实际电流（= 实测 τ）
+ *   上，所以内环本质上就是电流环，只是用 kTorqueK 换了个单位；
+ *   若想直接写成电流环：把内环反馈换成 GetNowCurrent()，增益与限幅同乘/同除
+ *   kTorqueK 即可，控制器等价。
+ *
+ * ## 待实测参数（当前为占位值，实车测量后锁定）
+ *
+ * | 参数 | 当前值 | 说明 |
+ * |------|--------|------|
+ * | `kWheelRadius` | 0.05 m | 轮半径（轮径 0.1m） |
+ * | `kChassisR` | 0.135 m | 轮心到车体中心的等效自转半径 |
+ * | `kWheelMix[][]` | ±√2/2 | 麦轮混控矩阵（含安装极性，方向不对只改这张表） |
+ * | 外环（速度） | kp=1.0 / ki=0.02 | 输出 = 力矩给定，需按实车整定 |
+ * | 内环（力矩） | kp=0.5 / ki=0.05 | 输出 / kTorqueK = 电流，需按实车整定 |
+ *
+ * @copyright Copyright (c) 2026
+ */
+
+#pragma message "Compiling Thread/Chassis"
+
+#include "from_head.hpp"
+#include "gimbal_to.hpp"
+#include "inter_cmd.hpp"
+#include "thread.hpp"
+#include "Init_entry.hpp"
+#include "trd_chassis.hpp"
+
+#include <algorithm>
+#include <math.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(chassis, LOG_LEVEL_INF);
+
+namespace {
+
+/// √2/2：麦轮驱动方向与车体轴成 45°，车体速度投影到轮上有这个归一化系数
+constexpr float kSqrt2_2 = 0.70710678f;
+
+/// 指令归一化限幅（上板的异常值不允许放大成危险速度）
+float ClampUnit(float v) { return std::clamp(v, -1.0f, 1.0f); }
+
+} // namespace
+
+namespace thread::chassis {
+
+using namespace instance::chassis;
+
+static Thread<2048> thread_ {};
+
+// ==================== 机械（待实测） ====================
+static constexpr float kWheelRadius  = 1.0f;            // 轮半径 m（轮径 0.1m）
+static constexpr float kChassisR     = 2.7f;           // 轮心到车体中心等效自转半径 m
+static constexpr float kGearboxRatio = 3591.f / 187.f;   // M3508 + C620 减速比
+
+// ==================== 电气（C620 + M3508） ====================
+static constexpr float kTorqueK      = 0.3f;                     // 转矩常数 N·m/A
+static constexpr float kCurrentMax   = 20.0f;                    // 电调电流上限 A
+static constexpr float kCurrentScale = 16384.0f / kCurrentMax;   // A → 原始值
+static constexpr float kTorqueMax    = kTorqueK * kCurrentMax;   // 力矩上限 N·m（= 内环/外环输出限幅）
+
+// ==================== 指令限幅与周期 ====================
+static constexpr float    kMaxMoveVelocity  = 10.0f;      // 平移线速度上限 m/s
+static constexpr float    kMaxRotationOmega = 2.0f;      // 自转角速度上限 rad/s
+static constexpr float    kMaxWheelOmega    = 20.0f;     // 单轮输出轴角速度上限 rad/s（安全限）
+static constexpr uint32_t kPeriodMs         = 1;         // 控制周期
+static constexpr uint16_t kChassisTxId      = 0x200;     // 底盘控制帧 ID（4 × int16 电流）
+
+// ==================== 麦轮混控矩阵 ====================
+//
+// 行 = 电机（与 CAN 0x201~0x204 一一对应），列 = (vx, vy, 自转)：
+//
+//     v_wheel[i]  = mix[i][0]·vx + mix[i][1]·vy + mix[i][2]·(kChassisR·ω)   [m/s]
+//     ω_target[i] = v_wheel[i] / kWheelRadius                               [rad/s]
+//
+// 物理约束（实车校验用）：自转列对角反号、相邻同号；平移列按对角轮分成
+// (vx - vy) 与 (vx + vy) 两组。实车方向相反时只改这张表，不要改控制流。
+static constexpr float kWheelMix[kMotorCount][3] = {
+    { +kSqrt2_2, -kSqrt2_2, -kSqrt2_2 },   // 电机1（0x201）
+    { +kSqrt2_2, +kSqrt2_2, -kSqrt2_2 },   // 电机2（0x202）
+    { +kSqrt2_2, -kSqrt2_2, +kSqrt2_2 },   // 电机3（0x203）
+    { +kSqrt2_2, +kSqrt2_2, +kSqrt2_2 },   // 电机4（0x204）
+};
+
+/// 电机安装极性（正电流 → 车体正方向）：实测后锁定
+static constexpr int8_t kMotorPolarity[kMotorCount] = { -1, -1, +1, +1 };
+
+// ==================== 本线程私有状态 ====================
+// 只有 Task 读写，不需要锁；不要与其他线程共享这些量
+static bool chassis_stop = false;
+static float g_vx        = 0.0f;                // 底盘系前后速度 m/s
+static float g_vy        = 0.0f;                // 底盘系左右速度 m/s
+static float g_vw        = 0.0f;                // 自转角速度 rad/s
+static bool  g_cmdOnline = false;               // 上板指令是否有效
+static float g_yawGimbal = 0.0f;                // 云台相对底盘偏航角 rad
+static bool  g_yawValid  = false;               // 是否收到过有效云台角
+static float g_wheelTarget[kMotorCount]  {};    // 各轮目标角速度 rad/s
+static float g_wheelCurrent[kMotorCount] {};    // 各轮 PID 输出电流 A（功率限制插入点）
+static uint32_t g_txDrop = 0;                   // 发送队列丢帧计数（诊断用）
+
+static constexpr uint32_t kTxDropLogPeriod = 1000;   // 累计丢帧达到该值上报一次
+
+
+/**
+ * @brief 上板指令：底盘系线速度 / 自转 + 在线判定
+ *
+ * 状态通道 `pub_from_head` 由 thread/inter_rx 周期发布，且定义为
+ * ZBUS_OBSERVERS_EMPTY（无订阅者），因此这里必须用 zbus_chan_read 轮询：
+ * 既不占 subscriber，也不会因为多线程共用 subscriber 互相抢通知。
+ *
+ * 上板离线（online=false）时立即停车并清 PID 积分：底盘不允许使用陈旧指令。
+ */
+static void ReadCommand()
+{
+    static topic::from_head::Message msg {};
+    static bool online_prev = false;
+
+    if (zbus_chan_read(&pub_from_head, &msg, K_NO_WAIT) != 0) {
+        // 读忙（发布者正在更新）：沿用上一轮指令，不要清零
+        return;
+    }
+
+    if (!msg.online) {
+        g_vx = 0.0f;
+        g_vy = 0.0f;
+        g_vw = 0.0f;
+        for (auto &pid : chassis_motor_omega_pid) {
+            pid.SetIntegralError(0.0f);          // 防止恢复在线时积分残留冲一下
+        }
+    } else {
+        g_vx = ClampUnit(msg.comm.chassis_vx) * kMaxMoveVelocity;
+        g_vy = ClampUnit(msg.comm.chassis_vy) * kMaxMoveVelocity;
+
+        switch (static_cast<inter_cmd::SpinMode>(msg.comm.chassis_spin)) {
+        case inter_cmd::SpinMode::Spin:
+            g_vw = kMaxRotationOmega;            // 小陀螺：满速自转
+            break;
+        case inter_cmd::SpinMode::Stop:
+            g_vw = 0.0f;                         // 上板要求停转
+            chassis_stop = true;
+            break;
+        default:
+            g_vw = ClampUnit(msg.comm.chassis_rot) * kMaxRotationOmega;
+            chassis_stop = false;
+            break;
+        }
+    }
+
+    if (msg.online != online_prev) {
+        LOG_INF("command link %s", msg.online ? "online" : "OFFLINE -> stop");
+        online_prev = msg.online;
+    }
+    g_cmdOnline = msg.online;
+}
+
+/**
+ * @brief 云台相对底盘偏航角（chassis-frame 变换的输入）
+ *
+ * 云台线程（生产者）尚未接入本板：
+ *   · 从未收到有效角 → 按 0 处理，即"云台朝前"，指令不做旋转，车仍能正常开；
+ *   · 收到过之后掉线 → 沿用最后一次有效角（云台机械上仍停在那里，跳回 0 更危险）。
+ */
+static void ReadGimbalYaw()
+{
+    static topic::gimbal_to::Message msg {};
+
+    if (zbus_chan_read(&pub_gimbal_to, &msg, K_NO_WAIT) != 0 || !msg.online) {
+        return;
+    }
+
+    g_yawGimbal = msg.yaw_rad;
+    if (!g_yawValid) {
+        g_yawValid = true;
+        LOG_INF("gimbal yaw source online");
+    }
+}
+
+/**
+ * @brief 云台系 → 底盘系旋转 + 麦轮逆解
+ *
+ * 上板给的是"云台坐标系"下的平移指令，底盘要按云台相对角 θ 转到车体系：
+ *
+ *     [vx_c]   [ cosθ  -sinθ ] [vx_g]
+ *     [vy_c] = [ sinθ   cosθ ] [vy_g]
+ */
+static void UpdateTarget()
+{
+    if (!g_cmdOnline || chassis_stop) {
+        // 停机态：目标直接归零，不做无意义的逆解（速度环仍工作 → 主动刹住轮子）
+        for (auto &target : g_wheelTarget) {
+            target = 0.0f;
+        }
+        return;
+    }
+
+    const float c  = cosf(g_yawGimbal);
+    const float s  = sinf(g_yawGimbal);
+    const float vx = c * g_vx - s * g_vy;
+    const float vy = s * g_vx + c * g_vy;
+
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        const float v_wheel = kWheelMix[i][0] * vx
+                            + kWheelMix[i][1] * vy
+                            + kWheelMix[i][2] * (kChassisR * g_vw);
+
+        g_wheelTarget[i] = std::clamp(kMotorPolarity[i] * v_wheel / kWheelRadius,
+                                      -kMaxWheelOmega, kMaxWheelOmega);
+    }
+}
+
+/**
+ * @brief 单轮双环 PID：外环轮速 → 内环力矩 → 电流
+ *
+ * 反馈统一取 ReadAll() 快照（模块内 seqlock 保护）：ω 与 τ 必须来自同一帧，
+ * 分开调用两个 getter 有可能取到不同帧的数据。ω 是输出轴 rad/s（模块已按
+ * 减速比折算），与目标同单位，不需要再乘/除减速比。
+ */
+static void ControlCalculate()
+{
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        const auto snap = chassis_motor[i].ReadAll();
+
+        // 外环：目标角速度 → 力矩给定
+        const float torque_ref = chassis_motor_omega_pid[i].Calc(g_wheelTarget[i], snap.omega);
+
+        // 内环：力矩给定 → 电流（电调收电流，故除以转矩常数）
+        g_wheelCurrent[i] = chassis_motor_torque_pid[i].Calc(torque_ref, snap.torque) / kTorqueK;
+    }
+
+    // TODO(功率限制)：此处把 g_wheelCurrent[] 交给 alg::power_ctrl::PowerCtrl<kMotorCount>
+    // 预测 + 分配，再把限幅后的电流写回 g_wheelCurrent[]，之后才组帧。
+}
+
+/**
+ * @brief 组帧 → 投入 CAN 发送队列（消费者：thread/can 的发送线程）
+ *  此外，再发送数据到上板
+ */
+static void FramePublish()
+{
+    topic::to_can_tx::Message msg {};
+    msg.tx_id = kChassisTxId;
+
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        // 电调只认 ±20A ↔ ±16384；越界会整数回绕 → 先限幅再换算
+        const float    amp = std::clamp(g_wheelCurrent[i], -kCurrentMax, kCurrentMax);
+        const uint16_t raw = static_cast<uint16_t>(static_cast<int16_t>(amp * kCurrentScale));
+
+        msg.data[i * 2 + 0] = static_cast<uint8_t>(raw >> 8);     // 高字节在前（C620 协议）
+        msg.data[i * 2 + 1] = static_cast<uint8_t>(raw & 0xFF);
+    }
+
+    if (k_msgq_put(chassis_tx, &msg, K_NO_WAIT) != 0) {
+        // 发送线程来不及取帧（正常不会发生）：丢当前帧并计数，控制环不阻塞
+        if ((++g_txDrop % kTxDropLogPeriod) == 1u) {
+            LOG_WRN("can tx queue full: %u frames dropped", static_cast<unsigned>(g_txDrop));
+        }
+    }
+}
+
+/**
+ * @brief 底盘控制主循环（固定 1ms 周期）
+ *
+ * 周期用 tick 计时：1ms = 2 个 tick（CONFIG_SYS_CLOCK_TICKS_PER_SEC=2000），
+ * 若用 k_uptime_get()（ms 粒度）算余量，实际周期会退化成 1~2ms 抖动。
+ */
+static void Task(void*, void*, void*)
+{
+    for (;;)
+    {
+        const int64_t tick_start = k_uptime_ticks();
+        
+        ReadCommand();
+        ReadGimbalYaw();
+        UpdateTarget();
+        ControlCalculate();
+        FramePublish();
+
+        const int64_t period = k_ms_to_ticks_ceil64(kPeriodMs);
+        const int64_t used   = k_uptime_ticks() - tick_start;
+        if (used < period) {
+            k_sleep(K_TICKS(period - used));
+        }
+    }
+}
+
+bool thread_init()
+{
+    const float dt = static_cast<float>(kPeriodMs) / 1000.0f;        // 与控制周期一致
+
+    // 外环：轮速 → 力矩给定（输出限幅在物理力矩内）
+    alg::pid::Pid::Config omega_cfg {};
+    omega_cfg.kp      = 1.0f;                                       // 待整定
+    omega_cfg.ki      = 0.02f;                                      // 待整定
+    omega_cfg.kd      = 0.0f;
+    omega_cfg.iOutMax = kTorqueMax;
+    omega_cfg.outMax  = kTorqueMax;
+    omega_cfg.dt      = dt;
+    omega_cfg.dFirst  = alg::pid::DFirst::Enable;                   // 后续加 D 项时作用于测量值
+
+    // 内环：力矩 → 电流（输出再 / kTorqueK 得到 A）
+    alg::pid::Pid::Config torque_cfg {};
+    torque_cfg.kp      = 0.5f;                                      // 待整定
+    torque_cfg.ki      = 0.05f;                                     // 待整定
+    torque_cfg.kd      = 0.0f;
+    torque_cfg.iOutMax = kTorqueMax;
+    torque_cfg.outMax  = kTorqueMax;
+    torque_cfg.dt      = dt;
+    torque_cfg.dFirst  = alg::pid::DFirst::Enable;
+
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        motor::dji::DjiC620::Config motor_cfg {};
+        motor_cfg.rx_id         = kMotorRxId[i];
+        motor_cfg.gearbox_ratio = kGearboxRatio;
+        motor_cfg.torque_k      = kTorqueK;
+        // 模块内 velocity = ω_out · wheel_r · 0.5，所以这里传轮径 = 2 × 轮半径
+        motor_cfg.wheel_r       = 2.0f * kWheelRadius;
+
+        chassis_motor[i].Init(motor_cfg);
+        chassis_motor_omega_pid[i].Init(omega_cfg);
+        chassis_motor_torque_pid[i].Init(torque_cfg);
+    }
+
+    // 日志里不打印浮点：Zephyr log 的 cbprintf 默认不带 %f 支持
+    LOG_INF("chassis ready: %u wheels, rx 0x%03x-0x%03x, tx 0x%03x, %u ms, tauMax %u mN.m",
+            static_cast<unsigned>(kMotorCount),
+            static_cast<unsigned>(kMotorRxId[0]),
+            static_cast<unsigned>(kMotorRxId[kMotorCount - 1]),
+            static_cast<unsigned>(kChassisTxId),
+            static_cast<unsigned>(kPeriodMs),
+            static_cast<unsigned>(kTorqueMax * 1000.0f));
+    return true;
+}
+
+bool thread_start()
+{
+    thread_.Start(Task, ThreadPrio::High);
+    return true;
+}
+
+// CAN 收帧注册：每个反馈 ID 一个入口（分发器只给帧数据，不给 ID）
+CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x201, [](uint8_t *data) { chassis_motor[0].CanCpltRxCallback(data); }, motor1);
+CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x202, [](uint8_t *data) { chassis_motor[1].CanCpltRxCallback(data); }, motor2);
+CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x203, [](uint8_t *data) { chassis_motor[2].CanCpltRxCallback(data); }, motor3);
+CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x204, [](uint8_t *data) { chassis_motor[3].CanCpltRxCallback(data); }, motor4);
+
+REGISTER_INIT  (thread_init,  MidInit,   Mid, "chassis_init");
+REGISTER_THREAD(thread_start, MidThread, Mid, "chassis_start");
+
+} // namespace thread::chassis

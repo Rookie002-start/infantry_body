@@ -1,0 +1,125 @@
+# temp/Kconfig - 用户区业务 Kconfig（位置：/home/rookie/zephyrproject/projects/temp）
+# 业务门禁符号（PRJ_MAIN / TRD_XXX）保持原名，架构层 DUST_ 符号由
+# framework 模块机制自动加载（module.yml kconfig: zephyr/Kconfig）。
+
+config DEBUG_LOG
+    bool "Enable Zephyr LOG output"
+    default n
+    select LOG
+    select LOG_BACKEND_UART
+
+config PRJ_MAIN
+    bool "Main business project"
+    default n
+    select DEBUG_LOG
+
+if PRJ_MAIN
+
+# =================               TRD_CONFIG                ====================
+
+config TRD_GPIO
+    bool "GPIO thread task"
+    default n
+    help
+      Enable the GPIO idle thread.
+
+config TRD_CAN
+    bool "CAN thread task"
+    default y
+    select DUST_COM_CAN
+    select DUST_TPC_TO_CAN_TX
+    help
+      Enable the CAN idle thread.
+
+config TRD_CHASSIS
+    bool "Chassis control thread"
+    default n
+    select TRD_CAN
+    select DUST_COM_CAN
+    select DUST_CTL_PID
+    select DUST_MOD_DEV_MOTOR_DJI
+    select DUST_TPC_TO_CAN_TX
+    select DUST_TPC_FROM_HEAD
+    select DUST_TPC_GIMBAL_TO
+    select INTER_CMD
+    help
+      底盘控制线程（thread/chassis/trd_chassis.cpp）：1ms 周期，
+      上板指令 → 云台系旋转 → 麦轮逆解 → 单轮速度环 → 0x200 控制帧。
+
+      本项自动 select TRD_CAN（user-can1 总线所有者 + 控制帧发送泵）。
+      上板指令来自 pub_from_head，需要板级 conf 同时打开 TRD_MCU_INTER
+      （user-can2 所有者）与 TRD_INTER_RX（发布者）；两者未开时通道始终
+      为 offline，底盘保持停车（安全方向）。
+      设备树依赖：别名 user-can1（电机 CAN）、user-can2（上下板通信）。
+      功率限制尚未接入，见 trd_chassis.cpp 的 TODO(功率限制)。
+      云台相对角来自 pub_gimbal_to；云台线程未接入时按 0（云台朝前）处理。
+
+config TRD_MCU_INTER
+    bool "Inter-board FDCAN TX thread (lower -> upper)"
+    default n
+    select DUST_COM_CAN
+    select DUST_TPC_TO_MCU_TX
+    select INTER_CMD
+    help
+      下板 → 上板发送线程：聚合 Dir::Down 状态分片，定长发出到 0x200。
+      本线程是 user-can2 总线的所有者（Init + 收帧分发入口），
+      接收侧 TRD_INTER_RX 依赖它完成总线初始化。
+      Note: 依赖设备树别名 user-can2，仅在有该总线的板卡上开启。
+
+config TRD_INTER_RX
+    bool "Inter-board RX thread (from upper board)"
+    default n
+    select DUST_COM_CAN
+    select DUST_TPC_FROM_HEAD
+    select INTER_CMD
+    help
+      Enable the upper-board receive thread: state frame (zbus publish + timeout
+      strategy). Requires DT alias user-can2.
+
+config TRD_TEST
+    bool "TEST thread task"
+    default y
+    help
+      Enable the TEST thread.
+
+config TRD_REMOTE
+    bool "REMOTE thread task"
+    default n
+    select DUST_MOD_DEV_REMOTE
+    select DUST_MOD_DEV_REMOTE_VT13
+    help
+      Enable the REMOTE thread.
+
+config TRD_IMU
+    bool "IMU thread task"
+    default n
+    select DUST_MOD_DEV_IMU
+    help
+      Enable the IMU thread.
+
+choice TRD_IMU_SOURCE
+    prompt "IMU source"
+    default TRD_IMU_SRC_HIPNUC
+    depends on TRD_IMU
+    help
+      选择底层 IMU 数据源。三种源互斥：链接段 .imu 只允许注册一个设备。
+
+config TRD_IMU_SRC_BMI088
+    bool "BMI088 (SPI, with heater)"
+    select DUST_MOD_DEV_IMU_BMI088
+
+config TRD_IMU_SRC_ICM42688P
+    bool "ICM42688P (SPI, with heater)"
+    select DUST_MOD_DEV_IMU_ICM42688P
+
+config TRD_IMU_SRC_HIPNUC
+    bool "HiPNUC (UART, fused output)"
+    select DUST_MOD_DEV_IMU_HIPNUC
+
+endchoice
+
+endif # PRJ_MAIN
+
+source "Kconfig.zephyr"
+rsource "my_topic/Kconfig"
+rsource "inter_cmd/Kconfig"

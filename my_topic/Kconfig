@@ -1,0 +1,23 @@
+config DUST_TPC_TO_MCU_TX
+    default n
+    bool "CAN TX queue"
+    help
+        MCU transmit message queue (upper/lower board), selected by TRD_MCU_INTER.
+
+config DUST_TPC_FROM_HEAD
+    default n
+    bool "Upper board RX channel"
+    select ZBUS
+    select INTER_CMD
+    help
+        Received data contract from the upper board: state channel (zbus).
+        Selected by TRD_INTER_RX./TRD_CHASSIS.
+        from_head.hpp 复用 inter_cmd.hpp 的结构体，故这里一并 select INTER_CMD
+        （INTER_CMD 提供该头文件的 include 路径与 to_mcu_tx 依赖）。
+
+config DUST_TPC_GIMBAL_TO
+    default n
+    bool "Gimbal to channel"
+    select ZBUS
+    help
+        Gimbal transmit data channel.
