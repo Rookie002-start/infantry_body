@@ -56,6 +56,7 @@ static void Task(void*, void*, void*)
         //     }
         // }
         printk("hello\r\n");
+        
         k_msleep(100);
     }
 }
