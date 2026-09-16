@@ -24,6 +24,14 @@ if(CONFIG_TRD_CHASSIS)
 	)
 endif()
 
+if(CONFIG_TRD_GIMBAL)
+	target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gimbal/trd_gimbal.cpp)
+	target_include_directories(app PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}
+		${CMAKE_CURRENT_SOURCE_DIR}/gimbal
+	)
+endif()
+
 if(CONFIG_TRD_TEST)
 	target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/trd_test.cpp)
 	target_include_directories(app PRIVATE

@@ -18,7 +18,7 @@
  *   if (zbus_chan_read(&pub_from_head, &head, K_NO_WAIT) != 0) {
  *       // 读失败（生产者持锁）→ 沿用上一轮值，不要清零
  *   }
- *   if (!head.online) { /* 安全降级 *\/ } else { /* 用 head.comm.... *\/ }
+ *   if (!head.online) { 安全降级（底盘停车） } else { 用 head.comm.chassis_vx ... }
  * @endcode
  *
  * @version 0.6

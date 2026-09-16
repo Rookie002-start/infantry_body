@@ -43,16 +43,53 @@ config TRD_CHASSIS
     select DUST_TPC_GIMBAL_TO
     select INTER_CMD
     help
-      底盘控制线程（thread/chassis/trd_chassis.cpp）：1ms 周期，
-      上板指令 → 云台系旋转 → 麦轮逆解 → 单轮速度环 → 0x200 控制帧。
+      底盘控制线程（thread/chassis/trd_chassis.cpp）：1ms 周期
 
-      本项自动 select TRD_CAN（user-can1 总线所有者 + 控制帧发送泵）。
-      上板指令来自 pub_from_head，需要板级 conf 同时打开 TRD_MCU_INTER
-      （user-can2 所有者）与 TRD_INTER_RX（发布者）；两者未开时通道始终
-      为 offline，底盘保持停车（安全方向）。
-      设备树依赖：别名 user-can1（电机 CAN）、user-can2（上下板通信）。
-      功率限制尚未接入，见 trd_chassis.cpp 的 TODO(功率限制)。
-      云台相对角来自 pub_gimbal_to；云台线程未接入时按 0（云台朝前）处理。
+config TRD_GIMBAL
+    bool "Gimbal control thread"
+    default n
+    select DUST_COM_CAN
+    select DUST_CTL_PID
+    select DUST_MOD_DEV_MOTOR_DM
+    select DUST_TPC_TO_CAN_TX
+    select DUST_TPC_FROM_HEAD
+    select DUST_TPC_GIMBAL_TO
+    select INTER_CMD
+    help
+      云台控制线程（thread/gimbal/trd_gimbal.cpp）：1ms 周期，
+      yaw/pitch 各一台 DM 电机，双环 PID（角度环 → 角速度环 → 力矩）。
+
+      本线程是 user-can3 总线的所有者（Init + 收帧分发入口），
+      控制帧经 topic::to_can_tx 的 user_can3_msgq 外发；
+      目标角来自 pub_from_head（上板指令），实测角经 inter_cmd Dir::Down
+      回发上板，同时把"云台相对底盘 yaw"发布到 pub_gimbal_to 供底盘使用。
+      设备树依赖：别名 user-can3，见 boards/*/*.overlay。
+
+choice TRD_GIMBAL_FB_SOURCE
+    prompt "Gimbal angle feedback"
+    default TRD_GIMBAL_FB_ENCODER
+    depends on TRD_GIMBAL
+    help
+      位置环的角度反馈来源，两种模式互斥（Kconfig choice）。
+      两种模式都要求 IMU/编码器与电机正方向一致，方向不符时改
+      trd_gimbal.cpp 里的 k*MotorSign / k*ImuSign。
+
+config TRD_GIMBAL_FB_ENCODER
+    bool "Motor encoder (relative to chassis)"
+    help
+      用 DM 电机编码器角度做反馈：控制的是"云台相对底盘"的角，
+      底盘自转时云台跟着转。不依赖 IMU，作为默认模式。
+
+config TRD_GIMBAL_FB_IMU
+    bool "IMU absolute angle (IMU must follow the gimbal)"
+    select TRD_IMU
+    select DUST_TPC_IMU_TO
+    help
+      用 imu_to 的 yaw_total/pitch 做反馈：控制世界系绝对角，
+      底盘自转时云台可稳住指向。要求 IMU 随云台运动（装在云台上），
+      且 IMU 掉线即不再驱动电机（保持 0 力矩）。
+      注意 IMU 源要与板级一致（dm_mc02 上是 BMI088，不是 HiPNUC）。
+endchoice
 
 config TRD_MCU_INTER
     bool "Inter-board FDCAN TX thread (lower -> upper)"

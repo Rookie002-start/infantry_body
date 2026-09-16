@@ -29,7 +29,7 @@ namespace instance::chassis
     constexpr auto *chassis_tx = &user_can1_msgq;
     constexpr auto *to_head = &user_can2_msgq;
 
-    constexpr uint8_t  kMotorCount = 4;                                        ///< 麦轮数量
+    constexpr uint8_t  kMotorCount = 4;                                        ///< 轮数量
     constexpr uint16_t kMotorRxId[kMotorCount] = {0x201, 0x202, 0x203, 0x204}; ///< C620 反馈 ID
 
     inline motor::dji::DjiC620 chassis_motor[kMotorCount] {};                  ///< C620 + M3508
