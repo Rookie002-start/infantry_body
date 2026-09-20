@@ -15,11 +15,11 @@
  * | 数据 | 通道 / 段 | 生产者 | 本线程的角色 |
  * |------|-----------|--------|--------------|
  * | 目标角 | zbus `pub_from_head` | thread/inter_rx | 轮询读（offline → 冻结虚拟角） |
- * | IMU 角反馈 | zbus `pub_imu_to`（仅 IMU 模式） | thread/imu | 订阅取最新并排空队列 |
+ * | IMU 角反馈 | zbus `pub_imu_to`（仅 IMU 模式） | thread/imu | 轮询取最新值（version 变化 = 新样本） |
  * | 编码器角反馈 | `.can_rx3` 段 | 本线程（总线所有者） | 只注册 CAN_RX_HANDLER |
  * | 电机控制帧 | k_msgq `user_can3_msgq` | 本线程 | 入队后由本线程外发 |
  * | 云台相对底盘角 | zbus `pub_gimbal_to` | 本线程 | 发布（底盘做云台系→车体系变换） |
- * | 实测 yaw/pitch | inter_cmd `Dir::Down` | 本线程 | PostFrame 发给上板 |
+ * | 电机反馈 yaw | topic `gimbal_to` | 本线程 | 发送线程拉取后打包发给上板 |
  *
  * 总线所有权：user-can3 由本线程持有并初始化（Init + 收帧分发入口），
  * 与 thread/can（can1）、thread/mcu_inter（can2）的约定一致。
@@ -96,7 +96,6 @@
 
 #include "from_head.hpp"
 #include "gimbal_to.hpp"
-#include "inter_cmd.hpp"
 #include "thread.hpp"
 #include "Init_entry.hpp"
 #include "trd_gimbal.hpp"
@@ -210,8 +209,9 @@ struct Feedback {
  * 状态通道 pub_from_head 由 thread/inter_rx 发布，定义为 ZBUS_OBSERVERS_EMPTY，
  * 因此用 zbus_chan_read 轮询（不占 subscriber）。
  *
- * 上板离线时不更新指令角 → 虚拟角冻结、位置环继续稳住当前姿态；
- * 云台不像底盘那样"离线即停"：突然失能会让 pitch 自由掉落，更危险。
+ * 上板离线、或遥控链路失效（CommState.flags 没有 LinkOk 位）时不更新指令角 →
+ * 虚拟角冻结、位置环继续稳住当前姿态；云台不像底盘那样"离线即停"：
+ * 突然失能会让 pitch 自由掉落，更危险。
  */
 static void ReadCommand()
 {
@@ -222,9 +222,12 @@ static void ReadCommand()
         return;                                    // 读忙：沿用上一轮指令
     }
 
-    if (!msg.online) {
+    const bool cmd_ok = msg.online && inter_cmd::CommLinkOk(msg.comm);
+
+    if (!cmd_ok) {
         if (online_prev) {
-            LOG_INF("gimbal command OFFLINE -> hold angle");
+            LOG_INF("gimbal command OFFLINE (head=%u link=%u) -> hold angle",
+                    msg.online ? 1u : 0u, inter_cmd::CommLinkOk(msg.comm) ? 1u : 0u);
         }
         online_prev = false;
         return;
@@ -260,25 +263,18 @@ static void UpdateTarget()
 /**
  * @brief IMU 模式：取 imu_to 最新一帧的世界系角度
  *
- * 订阅者队列必须每拍排空：IMU 侧用 zbus_chan_pub(..., K_MSEC(1)) 发布，
- * 队列积压会让它返回 -EAGAIN（表现为 IMU 线程被拖慢）。
+ * imu_to 通道无订阅者：轮询最新值即可（version 变化才算新样本），
+ * 既不会积压队列，也不会让 IMU 侧的发布返回 -EAGAIN。
  * 超时（kImuTimeoutMs 内没有新帧）判为无效 → 上层不再驱动电机。
  */
 static Feedback ReadImuFeedback()
 {
     static topic::imu_to::Message msg {};
+    static uint32_t last_ver = 0;
     static uint32_t last_ms = 0;
 
-    const zbus_channel *chan = nullptr;
-    bool got = false;
-
-    while (zbus_sub_wait(&sub_imu_to, &chan, K_NO_WAIT) == 0 && chan != nullptr) {
-        if (zbus_chan_read(chan, &msg, K_NO_WAIT) == 0) {
-            got = true;
-        }
-    }
-
-    if (got) {
+    if (zbus_chan_read(&pub_imu_to, &msg, K_NO_WAIT) == 0 && msg.version != last_ver) {
+        last_ver = msg.version;
         last_ms = k_uptime_get_32();
     }
 
@@ -460,13 +456,10 @@ static void PublishAngles(const Feedback &fb, float yaw_relative, bool online)
     g.version      = ++g_gimbal_version;
     g.timestamp_ms = k_uptime_get_32();
     g.yaw_rad      = NormalizeAngle(yaw_relative);
+    g.yaw_fb_rad   = fb.yaw;          // 上板要的云台电机反馈 yaw
+    g.pitch_fb_rad = fb.pitch;        // 上板要的云台电机反馈 pitch
     g.online       = online;
     (void)zbus_chan_pub(&pub_gimbal_to, &g, K_NO_WAIT);
-
-    inter_cmd::GimbalState st {};
-    st.yaw   = fb.yaw;
-    st.pitch = fb.pitch;
-    inter_cmd::PostFrame(inter_cmd::FrameType::StateGimbal, st);
 }
 
 /**

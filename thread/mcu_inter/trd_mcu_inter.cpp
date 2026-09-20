@@ -2,8 +2,10 @@
  * @file trd_mcu_inter.cpp
  * @author qingyu
  * @brief 下板 → 上板发送线程（经典 CAN 拆帧）
- *        - 入队的状态分片存进【本线程私有】缓存，按 Dir::Down 布局聚合成 12B 聚合帧
- *        - 聚合帧按字节拆成 2 帧（0x200 / 0x201）周期发出
+ *        - 状态分片有两个来源：
+ *          ① 拉取（pull）：本板已有消费者、只发一次通道的量 → RefreshFromChannels()
+ *          ② 入队（push）：只给对端用、本地没人消费的量 → PostFrame 走 k_msgq
+ *        - 两个来源都写进同一份【本线程私有】分片缓存，聚合成 8B 聚合帧后按帧发出（0x200）
  *
  * ⚠️ 本线程是 user-can2 总线的所有者：初始化与收帧分发入口都在这里。
  *    接收侧（thread/inter_rx）只注册 CAN_RX_HANDLER，**不要**再次 Can::Init() /
@@ -26,6 +28,7 @@
 #include "Init_entry.hpp"
 #include "to_mcu_tx.hpp"
 #include "inter_cmd.hpp"
+#include "gimbal_to.hpp"      // pull 来源：云台通道
 #include "can.hpp"
 #include "Irq_handlers.h"
 #include <string.h>
@@ -128,20 +131,37 @@ namespace thread::mcu_inter
         }
     }
 
+    /// ① 拉取来源：本板通道里的量（云台线程只发通道，这里拉过来打包）
+    /// 读失败（生产者持锁）时沿用上一轮缓存值，不清零。
+    static void RefreshFromChannels()
+    {
+        // GimbalState ← pub_gimbal_to（云台电机反馈 yaw + pitch）
+        static topic::gimbal_to::Message g {};
+        if (zbus_chan_read(&pub_gimbal_to, &g, K_NO_WAIT) == 0) {
+            const inter_cmd::GimbalState st { .yaw   = g.yaw_fb_rad,
+                                              .pitch = g.pitch_fb_rad };
+            UpdateSlot(inter_cmd::FrameType::StateGimbal,
+                       reinterpret_cast<const uint8_t *>(&st), sizeof(st));
+        }
+    }
+
     static void Task(void*, void*, void*)
     {
         for (;;)
         {
             const int64_t tick_start = k_uptime_get();
 
-            // 1) 清空队列：本方向各分片更新缓存
+            // 1) 拉取通道来源的分片
+            RefreshFromChannels();
+
+            // 2) 清空队列：只给对端用的分片（push 路径）
             topic::to_mcu_tx::Message ev{};
             while (k_msgq_get(&user_can2_msgq, &ev, K_NO_WAIT) == 0)
             {
                 UpdateSlot(static_cast<inter_cmd::FrameType>(ev.tag), ev.data, ev.len);
             }
 
-            // 2) 聚合本方向状态帧 → 拆帧发出
+            // 3) 聚合本方向状态帧 → 拆帧发出
             uint8_t buf[kFrameSize];
             const uint8_t len = PackState(buf);
             if (len > 0) {

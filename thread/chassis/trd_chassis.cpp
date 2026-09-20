@@ -151,7 +151,8 @@ static constexpr uint32_t kTxDropLogPeriod = 1000;   // 累计丢帧达到该值
  * ZBUS_OBSERVERS_EMPTY（无订阅者），因此这里必须用 zbus_chan_read 轮询：
  * 既不占 subscriber，也不会因为多线程共用 subscriber 互相抢通知。
  *
- * 上板离线（online=false）时立即停车并清 PID 积分：底盘不允许使用陈旧指令。
+ * 上板离线（online=false）、或遥控链路失效（CommState.flags 没有 LinkOk 位）时
+ * 立即停车并清 PID 积分：底盘不允许使用陈旧指令。
  */
 static void ReadCommand()
 {
@@ -163,7 +164,11 @@ static void ReadCommand()
         return;
     }
 
-    if (!msg.online) {
+    // 只看 CAN 帧有没有到是不够的：上板数据源（遥控）掉线时帧照样每 2ms 到，
+    // 只是里面是"全 0 + 无 LinkOk"的失效指令。两种情况都必须停车。
+    const bool cmd_ok = msg.online && inter_cmd::CommLinkOk(msg.comm);
+
+    if (!cmd_ok) {
         g_vx = 0.0f;
         g_vy = 0.0f;
         g_vw = 0.0f;
@@ -189,11 +194,17 @@ static void ReadCommand()
         }
     }
 
-    if (msg.online != online_prev) {
-        LOG_INF("command link %s", msg.online ? "online" : "OFFLINE -> stop");
-        online_prev = msg.online;
+    if (cmd_ok != online_prev) {
+        if (!msg.online) {
+            LOG_INF("command link OFFLINE (head lost) -> stop");
+        } else if (!inter_cmd::CommLinkOk(msg.comm)) {
+            LOG_INF("command link OFFLINE (remote failsafe) -> stop");
+        } else {
+            LOG_INF("command link online");
+        }
+        online_prev = cmd_ok;
     }
-    g_cmdOnline = msg.online;
+    g_cmdOnline = cmd_ok;
 }
 
 /**

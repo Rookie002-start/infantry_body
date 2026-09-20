@@ -31,6 +31,11 @@ namespace topic::from_head
         /// 超时判定结果。false = 上板数据已失效（上电初值为 false）
         ///  消费者必须先检查该标志，不要直接使用陈旧字段
         bool     online{};
+        /// 注意：online 只表示"CAN 帧还有在到"。上板数据源（遥控/IMU）掉线时帧照样每 2ms 到，
+        /// 只是内容变成失效值 —— 所以还要看 comm.flags：
+        ///   inter_cmd::CommLinkOk(comm) 遥控链路有效（速度/云台指令可信）
+        ///   inter_cmd::CommImuOk(comm)  IMU 数据新鲜（imu 字段可信）
+        /// 判失效的完整条件：!online || !CommLinkOk(comm)
         /// 该帧年龄（ms），供消费者使用比接收侧更细的超时阈值
         uint16_t age_ms{};
     };
