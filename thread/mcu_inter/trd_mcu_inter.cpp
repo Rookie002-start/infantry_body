@@ -5,16 +5,15 @@
  *        - 状态分片有两个来源：
  *          ① 拉取（pull）：本板已有消费者、只发一次通道的量 → RefreshFromChannels()
  *          ② 入队（push）：只给对端用、本地没人消费的量 → PostFrame 走 k_msgq
- *        - 两个来源都写进同一份【本线程私有】分片缓存，聚合成 8B 聚合帧后按帧发出（0x200）
+ *        - 两个来源都写进同一份【本线程私有】分片缓存，聚合成 12B 聚合帧后整帧发出（0x200）
  *
  * ⚠️ 本线程是 user-can2 总线的所有者：初始化与收帧分发入口都在这里。
  *    接收侧（thread/inter_rx）只注册 CAN_RX_HANDLER，**不要**再次 Can::Init() /
  *    SetRxCallback()，否则会重复注册过滤器并覆盖分发入口。
  *
- * ⚠️ 总线带宽（经典 CAN 1Mbps，8B 帧 ≈ 121µs）：
- *    本方向 2 帧 ≈ 0.21ms + 对端 8 帧 ≈ 0.94ms = 一轮 ≈ 1.15ms，
- *    所以周期不能取 1ms（会 115% 占满总线）。当前 kPeriodMs = 2（约 57%）；
- *    实测出现丢帧/错误帧就改成 5ms（约 23%）。
+ * ⚠️ 总线带宽（CAN FD：仲裁段 1Mbps / 数据段 2Mbps，FDF + BRS）：
+ *    本方向 12B 一帧 ≈ 0.12ms，对端 62B 一帧 ≈ 0.34ms，一轮合计 ≈ 0.46ms
+ *    → 1ms 周期约占 46%，可行。总线忙时靠 Can::Send 的超时等待空邮箱，不直接丢帧。
  *
  * @version 0.6
  * @date 2026-09-15
@@ -45,8 +44,8 @@ namespace thread::mcu_inter
     static constexpr inter_cmd::Dir kDir       = inter_cmd::Dir::Down;   // 本线程发送方向
     static constexpr uint8_t        kFrameSize = 64;                     // 聚合帧缓冲上限
     static constexpr uint8_t        kStateLen  = inter_cmd::FrameLen(kDir);    // 12
-    static constexpr uint8_t        kSliceNum  = inter_cmd::FrameCount(kDir);  // 2
-    static constexpr uint32_t       kPeriodMs  = 2;                      // 见文件头带宽说明
+    static constexpr uint32_t       kPeriodMs  = 1;                      // FD 整帧，见文件头带宽说明
+    static constexpr uint32_t       kTxTimeoutMs = 2;                    // 等空 TX 邮箱，别直接丢帧
 
     // ---- 私有分片缓存：按契约布局表下标索引（本线程独有，不共享 → 无需锁）----
     struct Slot
@@ -103,31 +102,25 @@ namespace thread::mcu_inter
         return any ? kStateLen : 0;
     }
 
-    /// 发一帧经典 CAN（≤8 字节，无 FD 标志）
-    static void SendSlice(uint16_t id, const uint8_t *data, uint8_t len)
+    /// 发一帧 CAN FD：整帧一次发完（FDF + BRS，DLC 用 can_bytes_to_dlc 编码）
+    static void SendFrame(const uint8_t *buf, uint8_t len)
     {
-        if (len == 0 || len > inter_cmd::kClassicPayload) {
+        if (len == 0 || len > CAN_MAX_DLEN) {
             return;
         }
         can_frame tx{};
-        tx.id    = id;
-        tx.flags = 0;                       // 经典 CAN：无 FDF / BRS
-        tx.dlc   = len;                     // 经典 CAN 的 DLC 就是字节数 0~8
-        memcpy(tx.data, data, len);
-        mcu_inter_can.Send(&tx);
-    }
-
-    /// 按固定映射把聚合帧拆成多帧发出（序号 ↔ 字节段一一对应）
-    static void SendState(const uint8_t *buf)
-    {
-        for (uint8_t i = 0; i < kSliceNum; ++i)
-        {
-            const uint8_t n = inter_cmd::SliceLen(kDir, i);
-            if (n == 0) {
-                continue;
+        tx.id    = inter_cmd::StateTxId(kDir);
+        tx.flags = CAN_FRAME_FDF | CAN_FRAME_BRS;   // FD 帧 + 数据段 2Mbps
+        tx.dlc   = can_bytes_to_dlc(len);
+        memcpy(tx.data, buf, len);
+        if (!mcu_inter_can.Send(&tx, K_MSEC(kTxTimeoutMs))) {
+            // 等不到空 TX 缓冲区（总线被占满 / 控制器没起来）：限流记录，别刷屏
+            static int64_t last_warn_ms = 0;
+            const int64_t now = k_uptime_get();
+            if (now - last_warn_ms >= 1000) {
+                last_warn_ms = now;
+                LOG_WRN("can tx busy (TX 缓冲区一直满)");
             }
-            SendSlice(inter_cmd::SliceId(kDir, i),
-                      buf + static_cast<uint8_t>(i * inter_cmd::kClassicPayload), n);
         }
     }
 
@@ -165,7 +158,7 @@ namespace thread::mcu_inter
             uint8_t buf[kFrameSize];
             const uint8_t len = PackState(buf);
             if (len > 0) {
-                SendState(buf);
+                SendFrame(buf, len);
             }
 
             const int64_t elapsed = k_uptime_get() - tick_start;
@@ -184,17 +177,17 @@ namespace thread::mcu_inter
             return false;
         }
 
-        // 经典 CAN：不加 CAN_MODE_FD
+        // CAN FD：必须进 FD 模式（FDOE/BRSE），否则发不出 FD 帧
         const can_filter filter{.id = 0, .mask = 0, .flags = 0};
-        if (!mcu_inter_can.Init(dev, filter)) {
+        if (!mcu_inter_can.Init(dev, filter, CAN_MODE_FD)) {
             LOG_ERR("mcu_inter_can init fail");
             return false;
         }
         // 收帧分发入口：接收侧（thread/inter_rx）的 CAN_RX_HANDLER 依赖它
         mcu_inter_can.SetRxCallback(user_can2_rx_callback);
-        LOG_INF("inter tx ready (dir=%s, %u frames, period=%ums)",
+        LOG_INF("inter tx ready (dir=%s, FD frame %uB, period=%ums)",
                 (kDir == inter_cmd::Dir::Up) ? "up" : "down",
-                static_cast<unsigned>(kSliceNum), static_cast<unsigned>(kPeriodMs));
+                static_cast<unsigned>(kStateLen), static_cast<unsigned>(kPeriodMs));
         return true;
     }
 
