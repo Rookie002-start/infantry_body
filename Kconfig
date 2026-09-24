@@ -113,24 +113,34 @@ config TRD_MCU_INTER
     bool "Inter-board FDCAN TX thread (lower -> upper)"
     default n
     select DUST_COM_CAN
+    select TRD_INTER_BUS
     select DUST_TPC_TO_MCU_TX
     select DUST_TPC_GIMBAL_TO
     select INTER_CMD
     help
       下板 → 上板发送线程：聚合 Dir::Down 状态分片，定长发出到 0x200。
-      本线程是 user-can2 总线的所有者（Init + 收帧分发入口），
-      接收侧 TRD_INTER_RX 依赖它完成总线初始化。
-      Note: 依赖设备树别名 user-can2，仅在有该总线的板卡上开启。
+      总线初始化由 TRD_INTER_BUS 负责（不再绑在发送线程上）。
+      Note: 依赖设备树别名 inter-can，仅在有该总线的板卡上开启。
 
 config TRD_INTER_RX
     bool "Inter-board RX thread (from upper board)"
     default n
     select DUST_COM_CAN
+    select TRD_INTER_BUS
     select DUST_TPC_FROM_HEAD
     select INTER_CMD
     help
       Enable the upper-board receive thread: state frame (zbus publish + timeout
-      strategy). Requires DT alias user-can2.
+      strategy). Requires DT alias inter-can.
+
+config TRD_INTER_BUS
+    bool "Inter-board CAN bus owner (init only, no thread)"
+    default n
+    select DUST_COM_CAN
+    help
+      上下板通信总线所有者：只做 Can::Init(..., CAN_MODE_FD) + SetRxCallback，不建线程。
+      由 TRD_MCU_INTER / TRD_INTER_RX 自动 select；也可单独打开用于
+      "只调接收" / "只调发送"的调试场景。依赖设备树别名 inter-can。
 
 config TRD_TEST
     bool "TEST thread task"

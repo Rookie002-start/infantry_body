@@ -7,6 +7,7 @@
 	aliases {
 		user-can1    = &fdcan1;
 		user-can2	 = &fdcan2;
+		inter-can    = &fdcan2;      /* 上下板通信总线（与 head 同名，总线所有者组件用） */
 		user-can3	 = &fdcan3;
 		remote-uart  = &usart1;
 		debug-uart	 = &usart3;

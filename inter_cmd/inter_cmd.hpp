@@ -65,7 +65,7 @@ namespace inter_cmd
 
     // ============ 载荷结构体（packed：固定线缆布局，两端定义需完全一致）============
 
-    /// 状态分片（Up）：底盘/云台指令汇总 + 上板数据源标志（22B，偏移 0）
+    /// 状态分片（Up）：底盘/云台指令汇总 + 上板数据源标志 + 开关状态位（23B，偏移 0）
     struct __attribute__((packed)) CommState
     {
         float   yaw_angle;      // 云台偏航角【指令】(rad)
@@ -77,6 +77,18 @@ namespace inter_cmd
         /// 上板数据源标志，见 kCommFlag*。下板必须先检查 kCommFlagLinkOk 再用上面的指令：
         /// 只看 CAN 帧有没有到是不够的（上板数据源掉线时帧照样在发，只是内容是旧值/零值）。
         uint8_t flags;
+        /// 开关状态位（上板透传遥控开关；GCC 小端下从 bit0 开始排，两端编译器一致即可）
+        /// ⚠️ 同样是"指令"，下板要配合 CommLinkOk() 判活后再采信
+        struct
+        {
+            uint8_t Supercap       : 1;   // 超级电容：1-开
+            uint8_t AutoAim        : 1;   // 自瞄开关：1-开
+            uint8_t Gimbal_SetZero : 1;   // 云台归零：1-归零
+            uint8_t Booster_Status : 1;   // 发射机构状态：1-已启动（摩擦轮开且未失能）
+            uint8_t Fast_Run       : 1;   // 快跑：1-快跑
+            uint8_t Refresh_UI     : 1;   // 刷新 UI：1-刷新
+            uint8_t Reserved       : 2;
+        } Switch;
     };
 
     /// CommState.flags 位定义（上板写入，下板读取）
@@ -86,7 +98,7 @@ namespace inter_cmd
     inline bool CommLinkOk(const CommState &c) { return (c.flags & kCommFlagLinkOk) != 0u; }
     inline bool CommImuOk(const CommState &c)  { return (c.flags & kCommFlagImuOk)  != 0u; }
 
-    /// 状态分片（Up）：自瞄数据（24B，偏移 21）
+    /// 状态分片（Up）：自瞄数据（24B，偏移 23）
     struct __attribute__((packed)) AutoAimState
     {
         uint8_t yaw_angle[4];
@@ -97,7 +109,7 @@ namespace inter_cmd
         uint8_t pitch_torque[4];
     };
 
-    /// 状态分片（Up）：IMU 数据（16B，偏移 45）
+    /// 状态分片（Up）：IMU 数据（16B，偏移 47）
     struct __attribute__((packed)) ImuState
     {
         uint8_t total_yaw_angle[4];
@@ -123,9 +135,9 @@ namespace inter_cmd
     // ============ 聚合帧布局（唯一事实来源）============
 
     // 各分片在各自方向聚合帧中的偏移（协议事实，命名便于对照协议文档）
-    constexpr uint8_t kOffComm    = 0;    // CommState    22B → 0..21
-    constexpr uint8_t kOffAutoAim = 22;   // AutoAimState 24B → 22..45
-    constexpr uint8_t kOffImu     = 46;   // ImuState     16B → 46..61
+    constexpr uint8_t kOffComm    = 0;    // CommState    23B → 0..22
+    constexpr uint8_t kOffAutoAim = 23;   // AutoAimState 24B → 23..46
+    constexpr uint8_t kOffImu     = 47;   // ImuState     16B → 47..62
 
     constexpr uint8_t kOffGimbal  = 0;    // GimbalState   8B → 0..7
     constexpr uint8_t kOffShooter = 8;    // ShooterState  4B → 8..11

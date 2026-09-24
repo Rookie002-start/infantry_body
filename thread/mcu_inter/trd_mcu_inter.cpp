@@ -27,6 +27,7 @@
 #include "Init_entry.hpp"
 #include "to_mcu_tx.hpp"
 #include "inter_cmd.hpp"
+#include "trd_inter_bus.hpp"  // 总线所有者（Init 在里面，本线程只当使用者）
 #include "gimbal_to.hpp"      // pull 来源：云台通道
 #include "can.hpp"
 #include "Irq_handlers.h"
@@ -39,8 +40,6 @@ LOG_MODULE_REGISTER(mcu_inter, LOG_LEVEL_INF);
 namespace thread::mcu_inter
 {
     static Thread<2048> thread_{};
-    static Can mcu_inter_can{};
-
     static constexpr inter_cmd::Dir kDir       = inter_cmd::Dir::Down;   // 本线程发送方向
     static constexpr uint8_t        kFrameSize = 64;                     // 聚合帧缓冲上限
     static constexpr uint8_t        kStateLen  = inter_cmd::FrameLen(kDir);    // 12
@@ -113,7 +112,7 @@ namespace thread::mcu_inter
         tx.flags = CAN_FRAME_FDF | CAN_FRAME_BRS;   // FD 帧 + 数据段 2Mbps
         tx.dlc   = can_bytes_to_dlc(len);
         memcpy(tx.data, buf, len);
-        if (!mcu_inter_can.Send(&tx, K_MSEC(kTxTimeoutMs))) {
+        if (!inter_bus::Bus().Send(&tx, K_MSEC(kTxTimeoutMs))) {
             // 等不到空 TX 缓冲区（总线被占满 / 控制器没起来）：限流记录，别刷屏
             static int64_t last_warn_ms = 0;
             const int64_t now = k_uptime_get();
@@ -171,20 +170,8 @@ namespace thread::mcu_inter
 
     bool thread_init()
     {
-        const device *dev = DEVICE_DT_GET(DT_ALIAS(user_can2));
-        if (!device_is_ready(dev)) {
-            LOG_ERR("user_can2 not ready");
-            return false;
-        }
-
-        // CAN FD：必须进 FD 模式（FDOE/BRSE），否则发不出 FD 帧
-        const can_filter filter{.id = 0, .mask = 0, .flags = 0};
-        if (!mcu_inter_can.Init(dev, filter, CAN_MODE_FD)) {
-            LOG_ERR("mcu_inter_can init fail");
-            return false;
-        }
-        // 收帧分发入口：接收侧（thread/inter_rx）的 CAN_RX_HANDLER 依赖它
-        mcu_inter_can.SetRxCallback(user_can2_rx_callback);
+        // 总线 Init / FD 模式 / 收帧分发入口都由 thread/inter_bus 负责，
+        // 本线程只是使用者（这样"只开接收"时总线也照样会起来）
         LOG_INF("inter tx ready (dir=%s, FD frame %uB, period=%ums)",
                 (kDir == inter_cmd::Dir::Up) ? "up" : "down",
                 static_cast<unsigned>(kStateLen), static_cast<unsigned>(kPeriodMs));
