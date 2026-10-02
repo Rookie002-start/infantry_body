@@ -1,6 +1,6 @@
 /**
  * @file trd_mcu_inter.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 下板 → 上板发送线程（经典 CAN 拆帧）
  *        - 状态分片有两个来源：
  *          ① 拉取（pull）：本板已有消费者、只发一次通道的量 → RefreshFromChannels()

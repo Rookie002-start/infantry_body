@@ -1,6 +1,6 @@
 /**
  * @file trd_gimbal.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 云台控制线程 — 1ms 固定周期：上板指令 → 双环 PID → DM 控制帧 → user-can3
  * @version 0.2
  * @date 2026-09-16

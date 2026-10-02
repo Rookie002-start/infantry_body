@@ -1,6 +1,6 @@
 /**
  * @file vofa.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief VOFA+ JustFloat 输出组件实现 —— 组帧进环形缓冲，TX 中断逐字节外发
  * @version 0.1
  * @date 2026-09-26

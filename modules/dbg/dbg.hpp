@@ -1,6 +1,6 @@
 /**
  * @file dbg.hpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 公共调参接口 —— 用双环 PID 的业务对象把自己的参数登记给调参命令行
  * @version 1.0
  * @date 2026-09-27

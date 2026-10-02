@@ -1,6 +1,6 @@
 /**
  * @file vofa.hpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief VOFA+ 上位机波形输出组件 —— JustFloat 协议，串口取设备树别名 `vofa-uart`
  * @version 0.1
  * @date 2026-09-26

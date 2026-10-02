@@ -1,6 +1,6 @@
 /**
  * @file trd_chassis.hpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 底盘实例集合：电机对象 / 速度环 PID / CAN 数据槽位表
  * @version 1.1
  * @date 2026-09-15

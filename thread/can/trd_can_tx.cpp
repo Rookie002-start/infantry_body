@@ -1,6 +1,6 @@
 /**
  * @file trd_can_tx.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief user-can1 总线所有者 + 控制帧发送泵
  *        - 初始化 user-can1（Init + 收帧分发入口），电机反馈经该过滤器进 .can_rx1
  *        - 从 topic::to_can_tx 队列取帧发出（多生产者 / 单消费者，满时生产者丢帧）

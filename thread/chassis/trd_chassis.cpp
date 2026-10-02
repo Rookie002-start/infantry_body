@@ -1,6 +1,6 @@
 /**
  * @file trd_chassis.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 底盘控制线程 — 1ms 固定周期：指令 → 坐标变换 → 麦轮逆解 → 速度环 → 组帧
  * @version 0.4
  * @date 2026-09-29

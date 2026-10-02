@@ -1,6 +1,6 @@
 /**
  * @file dbg.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 公共调参命令行线程（RTT 收命令，改任何登记过的双环 PID 的 kp/ki）
  * @version 1.0
  * @date 2026-09-27

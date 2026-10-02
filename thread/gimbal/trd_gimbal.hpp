@@ -1,6 +1,6 @@
 /**
  * @file trd_gimbal.hpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 云台实例集合：DM 电机对象 / 双环 PID / CAN ID 表 / TX 队列
  * @version 0.2
  * @date 2026-09-16

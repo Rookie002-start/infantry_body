@@ -1,6 +1,6 @@
 /**
  * @file trd_vofa.cpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief VOFA+ 输出组件所有者实现（无 REGISTER_THREAD，只有 REGISTER_INIT）
  * @version 0.1
  * @date 2026-09-26

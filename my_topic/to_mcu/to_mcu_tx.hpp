@@ -1,6 +1,6 @@
 /**
  * @file to_mcu_tx.hpp
- * @author qingyu
+ * @author Rookie002-start
  * @brief 上下板通信数据契约（topic 层：只定义结构体与通道，不含业务逻辑、不含同步原语）
  * @version 0.4
  * @date 2026-09-11
