@@ -22,6 +22,10 @@ set(ZEPHYR_EXTRA_MODULES
   # 工程自带的 SEGGER RTT 模块（SEGGER 源码 + Zephyr 版配置头），
   # 构建/链接胶水直接复用 $ZEPHYR_BASE/modules/segger 里 Zephyr 自带的那份
   "${CMAKE_CURRENT_SOURCE_DIR}/modules/segger"
+  # 工程自带的 VOFA+ 波形输出组件（JustFloat，串口 = 设备树别名 vofa-uart）
+  "${CMAKE_CURRENT_SOURCE_DIR}/modules/vofa+"
+  # 工程自带的调参终端模块（RTT 收命令行改双环 PID 的 kp/ki，业务侧只 include dbg.hpp）
+  "${CMAKE_CURRENT_SOURCE_DIR}/modules/dbg"
 )
 set(ZEPHYR_SDK_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../zephyr-sdk-1.0.1" CACHE PATH "")
 
@@ -52,6 +56,11 @@ target_include_directories(app PRIVATE
   ${FW_ROOT}/init
   ${FW_ROOT}/cmd
 )
+
+# 框架把 PID 的 include 目录只 PRIVATE 加给了 app，而 modules/dbg（公共调参模块）
+# 的头文件里要用框架的 alg::pid::Pid —— 这里补一份全局的，模块库与业务都能 include。
+zephyr_include_directories(${FW_ROOT}/algorithm/controller/pid)
+
 # 板卡专属全局 include（由 boards/<board>/board.cmake 的 BOARD_GLOBAL_INCLUDES 提供）
 foreach(_dir IN LISTS BOARD_GLOBAL_INCLUDES)
   zephyr_include_directories(${_dir})

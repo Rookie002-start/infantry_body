@@ -80,17 +80,35 @@ namespace thread::inter_rx
     // ==================== 线程侧 ====================
 
     /// 按契约布局表解析并发布（方向/偏移/长度都来自 inter_cmd.hpp 的同一张表）
+    static float RdF32(const uint8_t *p) { float v{}; memcpy(&v, p, sizeof v); return v; }
+
     static void Publish(const uint8_t *raw, bool online, uint16_t age_ms)
     {
         topic::from_head::Message msg{};
-        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up,
-                                 inter_cmd::FrameType::StateComm,    msg.comm);
-        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up,
-                                 inter_cmd::FrameType::StateAutoAim, msg.autoaim);
-        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up,
-                                 inter_cmd::FrameType::StateImu,     msg.imu);
+        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up, inter_cmd::FrameType::StateComm,    msg.comm);
+        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up, inter_cmd::FrameType::StateAutoAim, msg.autoaim);
+        (void)inter_cmd::GetFrag(raw, inter_cmd::Dir::Up, inter_cmd::FrameType::StateImu,     msg.imu);
         msg.online = online;
         msg.age_ms = age_ms;
+
+        // 关键：先看 flags，再看数据；打印要限流，1ms 循环里 printk 会拖慢任务
+        static int64_t last_dbg = 0;
+        const int64_t now = k_uptime_get();
+        if (now - last_dbg >= 500) {
+            last_dbg = now;
+            // printk("flags=0x%02x online=%d age=%u yaw=%.4f pitch=%.4f yaw_w=%.4f pitch_w=%.4f\r\n",
+            //     msg.comm.flags, static_cast<int>(online), static_cast<unsigned>(age_ms),
+            //     static_cast<double>(RdF32(msg.imu.total_yaw_angle)),
+            //     static_cast<double>(RdF32(msg.imu.pitch_angle)),
+            //     static_cast<double>(RdF32(msg.imu.yaw_omega)),
+            //     static_cast<double>(RdF32(msg.imu.pitch_omega)));
+            // printk("vx:%f", msg.comm.chassis_vx);
+            // printk("vy:%f", msg.comm.chassis_vy);
+            // printk("yaw:%f", msg.comm.yaw_angle);
+            // printk("pitch:%f", msg.comm.pitch_angle);
+            // printk("spin:%d", msg.comm.chassis_spin);
+            
+        }
         (void)zbus_chan_pub(&pub_from_head, &msg, K_NO_WAIT);
     }
 

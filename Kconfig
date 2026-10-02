@@ -44,15 +44,19 @@ config TRD_GPIO
 config TRD_CAN
     bool "CAN thread task"
     default n
+    # 与 TRD_CHASSIS 冲突：user-can1 只能有一个所有者，
+    # Can::Init()（注册过滤器 + can_start）对一个设备做两次会失败
+    depends on !TRD_CHASSIS
     select DUST_COM_CAN
     select DUST_TPC_TO_CAN_TX
     help
-      Enable the CAN idle thread.
+      user-can1 单总线收发测试线程（thread/can/trd_can_tx.cpp）。
+      它是 user-can1 的总线所有者，而底盘线程（TRD_CHASSIS）持有同一条总线，
+      两者互斥：开底盘就用不到这个测试线程。
 
 config TRD_CHASSIS
     bool "Chassis control thread"
     default n
-    select TRD_CAN
     select DUST_COM_CAN
     select DUST_CTL_PID
     select DUST_MOD_DEV_MOTOR_DJI
@@ -63,11 +67,16 @@ config TRD_CHASSIS
     help
       底盘控制线程（thread/chassis/trd_chassis.cpp）：1ms 周期
 
+      本线程是 user-can1 总线的所有者：Init + SetRxCallback（电机反馈 → .can_rx1）
+      + 外发控制帧，所以不再 select TRD_CAN（那个只是单总线测试线程）。
+      设备树依赖：别名 user-can1，见 boards/*/*.overlay。
+
 config TRD_GIMBAL
     bool "Gimbal control thread"
     default n
     select DUST_COM_CAN
     select DUST_CTL_PID
+    select DUST_FLT_LPF
     select DUST_MOD_DEV_MOTOR_DM
     select DUST_TPC_TO_CAN_TX
     select DUST_TPC_FROM_HEAD
@@ -88,8 +97,11 @@ choice TRD_GIMBAL_FB_SOURCE
     default TRD_GIMBAL_FB_ENCODER
     depends on TRD_GIMBAL
     help
-      位置环的角度反馈来源，两种模式互斥（Kconfig choice）。
-      两种模式都要求 IMU/编码器与电机正方向一致，方向不符时改
+      只决定"IMU 那套反馈代码要不要编进来"，不再决定每轴用哪个源。
+      每轴、每环的选源在 trd_gimbal.cpp 顶部：kYawPosFb / kYawRateFb /
+      kPitchPosFb / kPitchRateFb（当前 yaw 两环走上板 IMU，pitch 两环走编码器）；
+      选了 FbSource::Imu 而这里是 ENCODER 时，编译期 static_assert 会直接报出来。
+      两种源都要求 IMU/编码器与电机正方向一致，方向不符时改
       trd_gimbal.cpp 里的 k*MotorSign / k*ImuSign。
 
 config TRD_GIMBAL_FB_ENCODER
@@ -99,14 +111,14 @@ config TRD_GIMBAL_FB_ENCODER
       底盘自转时云台跟着转。不依赖 IMU，作为默认模式。
 
 config TRD_GIMBAL_FB_IMU
-    bool "IMU absolute angle (IMU must follow the gimbal)"
-    select TRD_IMU
-    select DUST_TPC_IMU_TO
+    bool "IMU absolute angle (upper board IMU, sent with the command frame)"
     help
-      用 imu_to 的 yaw_total/pitch 做反馈：控制世界系绝对角，
-      底盘自转时云台可稳住指向。要求 IMU 随云台运动（装在云台上），
-      且 IMU 掉线即不再驱动电机（保持 0 力矩）。
-      注意 IMU 源要与板级一致（dm_mc02 上是 BMI088，不是 HiPNUC）。
+      用上板下发的 ImuState.total_yaw_angle/pitch_angle 做反馈（随上板指令帧
+      一起从 0x100 下来）：控制世界系绝对角，底盘自转时云台可稳住指向。
+      取上板而不是本板 imu_to，是因为 IMU 装在上板/云台侧，本板这路 IMU
+      的安装方向与云台对不上（换硬件排布时只改这里的选择，不动控制流）。
+      上板 IMU 失效（CommState.flags 的 kCommFlagImuOk 清零）或无帧时不再
+      驱动电机（保持使能、力矩 0），本板不再编译 IMU 线程，也不依赖 imu_to。
 endchoice
 
 config TRD_MCU_INTER
@@ -141,6 +153,24 @@ config TRD_INTER_BUS
       上下板通信总线所有者：只做 Can::Init(..., CAN_MODE_FD) + SetRxCallback，不建线程。
       由 TRD_MCU_INTER / TRD_INTER_RX 自动 select；也可单独打开用于
       "只调接收" / "只调发送"的调试场景。依赖设备树别名 inter-can。
+
+config TRD_VOFA
+    bool "VOFA+ JustFloat output owner (init only, no thread)"
+    default n
+    select VOFA
+    help
+      VOFA+ 输出组件所有者（thread/vofa/trd_vofa.cpp）：只在启动阶段调一次
+      vofa::Init()，不建线程、不周期发送。
+
+      单独拎出来是为了避免"哪个线程先调 Send() 谁就顺手初始化"——多线程同时
+      首调会重复初始化同一路串口。业务线程只调 vofa::Send()。
+
+      初始化失败只警告不停机（等级 Mid）：VOFA+ 是调试输出，板卡没有
+      vofa-uart 别名（比如 HPM 上板）时整车照常跑，Send() 空操作。
+      协议与用法见 modules/vofa+/README.md。
+
+# 调参终端（RTT 里改双环 PID）已经抽成独立模块：modules/dbg
+# （Kconfig 符号 CONFIG_DBG / CONFIG_DBG_UART_RX 由该模块提供，见 prj.conf）
 
 config TRD_TEST
     bool "TEST thread task"

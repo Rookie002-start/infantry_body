@@ -94,19 +94,24 @@ namespace inter_cmd
     /// CommState.flags 位定义（上板写入，下板读取）
     constexpr uint8_t kCommFlagLinkOk = 1u << 0;   // 遥控链路有效：速度/云台指令可信
     constexpr uint8_t kCommFlagImuOk  = 1u << 1;   // IMU 数据新鲜：ImuState 可信
+    constexpr uint8_t kCommFlagVisionOk   = 1u << 2;   // PC 自瞄链路有效：AutoAimState 可信
+    constexpr uint8_t kCommFlagVisionFire = 1u << 3;   // PC 请求开火（需 VisionOk 同时成立）
 
     inline bool CommLinkOk(const CommState &c) { return (c.flags & kCommFlagLinkOk) != 0u; }
     inline bool CommImuOk(const CommState &c)  { return (c.flags & kCommFlagImuOk)  != 0u; }
+    inline bool CommVisionOk(const CommState &c)   { return (c.flags & kCommFlagVisionOk)   != 0u; }
+    inline bool CommVisionFire(const CommState &c) { return (c.flags & kCommFlagVisionFire) != 0u; }
 
     /// 状态分片（Up）：自瞄数据（24B，偏移 23）
+    /// 采信前必须先看 CommState.flags 的 kCommFlagVisionOk（PC 掉线/未锁定即清零）。
     struct __attribute__((packed)) AutoAimState
     {
         uint8_t yaw_angle[4];
         uint8_t yaw_omega[4];
-        uint8_t yaw_torque[4];
+        uint8_t yaw_accl[4];      // 角加速度
         uint8_t pitch_angle[4];
         uint8_t pitch_omega[4];
-        uint8_t pitch_torque[4];
+        uint8_t pitch_accl[4];    // 角加速度
     };
 
     /// 状态分片（Up）：IMU 数据（16B，偏移 47）

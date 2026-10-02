@@ -6,18 +6,17 @@
 / {
 	aliases {
 		user-can1    = &fdcan1;
-		user-can2	 = &fdcan2;
 		inter-can    = &fdcan2;      /* 上下板通信总线（与 head 同名，总线所有者组件用） */
 		user-can3	 = &fdcan3;
 		remote-uart  = &usart1;
-		debug-uart	 = &usart3;
+		vofa-uart	 = &uart7;
 		bmi088-accel = &bmi088_accel;
 		bmi088-gyro  = &bmi088_gyro;
 		imu-pwm      = &imu_pwm;
 	};
 	chosen {
-		zephyr,console = &uart7;
-		zephyr,shell-uart = &uart7;
+		zephyr,console = &usart3;
+		zephyr,shell-uart = &usart3;
 	};
 	leds {
 		compatible = "gpio-leds";
@@ -92,6 +91,12 @@
 &fdcan1 {
 	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
 	pinctrl-names = "default";
+	/* FDCAN 内核时钟源必须显式选 PLL1Q(120MHz)。
+	 * 不写这一项时 RCC_D2CCIP1R.FDCANSEL 保持复位默认 = HSE(24MHz)，
+	 * 而驱动仍按 DT 里 120MHz 的时钟树算位时序（120 tq/位），
+	 * 结果实际位率只有标称的 1/5：1Mbps 变成 200kbps，总线上谁都收不到。 */
+	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
+		 <&rcc STM32_SRC_PLL1_Q FDCAN_SEL(1)>;
 	bitrate = <1000000>;
 	sample-point = <800>;
 	bitrate-data = <2000000>;
@@ -102,9 +107,12 @@
 &fdcan2 {
 	pinctrl-0 = <&fdcan2_rx_pb5 &fdcan2_tx_pb6>;
 	pinctrl-names = "default";
+	/* 同上：内核时钟必须显式选 PLL1Q(120MHz)，否则实际位率是 1/5 */
+	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
+		 <&rcc STM32_SRC_PLL1_Q FDCAN_SEL(1)>;
 	bitrate = <1000000>;
 	sample-point = <800>;
-	bitrate-data = <2000000>;
+	bitrate-data = <1000000>;
 	sample-point-data = <750>;
 	status = "okay";
 };
@@ -112,6 +120,9 @@
 &fdcan3 {
 	pinctrl-0 = <&fdcan3_rx_pd12 &fdcan3_tx_pd13>;
 	pinctrl-names = "default";
+	/* 同上：内核时钟必须显式选 PLL1Q(120MHz)，否则实际位率是 1/5 */
+	clocks = <&rcc STM32_CLOCK(APB1_2, 8)>,
+		 <&rcc STM32_SRC_PLL1_Q FDCAN_SEL(1)>;
 	bitrate = <1000000>;
 	status = "okay";
 };

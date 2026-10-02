@@ -1,0 +1,20 @@
+# modules/vofa+ —— VOFA+ 波形输出组件（JustFloat 协议）
+
+config VOFA
+	bool "VOFA+ JustFloat output"
+	default n
+	select SERIAL
+	select UART_INTERRUPT_DRIVEN
+	help
+	  把 float 通道按 JustFloat 协议发到 VOFA+ 上位机看波形：
+	  一帧 = n × 4 字节小端 float + 4 字节帧尾 {00 00 80 7F}。
+
+	  串口取设备树别名 vofa-uart（dm_mc02 上 = uart7，921600 8N1）。
+	  发送走 TX 中断 + 环形缓冲，组帧只 memcpy 一份就返回，所以可以直接
+	  在 1ms 控制环里调；缓冲放不下就丢整帧，不阻塞调用者。
+
+	  初始化（挂 TX 中断回调、建环形缓冲）只由所有者组件
+	  thread/vofa/trd_vofa.cpp（CONFIG_TRD_VOFA）在启动阶段做一次，
+	  业务线程只调 vofa::Send()，不要自己调 vofa::Init()。
+
+	  板卡没有 vofa-uart 别名时组件照常编译，只是 Init() 失败、Send() 空转。

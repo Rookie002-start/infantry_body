@@ -6,6 +6,7 @@
 / {
     aliases {
         user-can1   = &mcan0;
+        inter-can   = &mcan0;      /* 上下板通信总线（总线所有者组件用） */
         remote-uart = &uart4;
         hipnuc-uart = &uart3;
         imu-spi     = &icm42688p;

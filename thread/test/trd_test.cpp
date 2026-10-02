@@ -4,7 +4,7 @@
 #include "Init_entry.hpp"
 #include <zephyr/kernel.h>
 #include "zephyr/zbus/zbus.h"
-#include "from_head.hpp"
+#include "vofa.hpp"
 
 namespace thread::test {
 
@@ -12,19 +12,10 @@ static Thread<2048> thread_{};
 
 static void Task(void*, void*, void*)
 {
-    topic::from_head::Message g;
+    float tx[] = {0.1, 0.2, 0.3};
     for (;;)
     {
-        if (zbus_chan_read(&pub_from_head, &g, K_NO_WAIT) == 0)
-        {
-            printk("yaw_angle:%f\r\n", g.comm.yaw_angle);
-            printk("pitch_angle:%f\r\n", g.comm.pitch_angle);
-            printk("vx:%f\r\n", g.comm.chassis_vx);
-            printk("vy:%f\r\n", g.comm.chassis_vy);
-            printk("yaw:%f\r\n", g.imu.total_yaw_angle);
-            printk("pitch:%f\r\n", g.imu.pitch_angle);
-        }
-        
+        vofa::Send(tx, sizeof(tx) / sizeof(tx[0]));
         k_msleep(100);
     }
 }

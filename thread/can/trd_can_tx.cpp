@@ -45,18 +45,14 @@ static void Task(void*, void*, void*)
     {
         topic::to_can_tx::Message msg{};
 
-        // K_FOREVER：没有待发帧就睡在队列上，不空转、也不重复发旧帧
-        if (k_msgq_get(&user_can1_msgq, &msg, K_FOREVER) != 0) {
-            continue;
-        }
-
         // 契约固定 8 字节载荷（用 msg 的长度，不能用 sizeof(tx.data)：
         // CONFIG_CAN_FD_MODE=y 时 can_frame::data 是 64 字节）
         // 经典帧：flags 全 0，C620 只认经典帧
         can_frame tx{};
-        tx.id  = msg.tx_id;
+        tx.id  = 0x02;
         tx.dlc = 8;
-        memcpy(tx.data, msg.data, sizeof(msg.data));
+        uint8_t tx_data[] = {0xFF, 0xFF, 0xFF, 0xFF,0xFF, 0xFF,0xFF, 0xFD};
+        memcpy(tx.data, tx_data, sizeof(tx_data));
 
         if (!user_can1.Send(&tx)) {
             // 总线异常时每帧都会失败，限频上报，避免刷屏拖慢发送线程
@@ -65,13 +61,19 @@ static void Task(void*, void*, void*)
                         static_cast<unsigned>(msg.tx_id), static_cast<unsigned>(tx_fail));
             }
         }
+        k_msleep(200);
     }
+}
+
+void my_rxcallback(struct can_frame &frame, void *)
+{
+    printk("can3callback");
 }
 
 bool thread_init()
 {
     {
-        const device* dev = DEVICE_DT_GET(DT_ALIAS(user_can1));
+        const device* dev = DEVICE_DT_GET(DT_ALIAS(user_can3));
         if (!device_is_ready(dev)) {
             LOG_ERR("user_can1 not ready");
             return false;
@@ -83,6 +85,9 @@ bool thread_init()
             return false;
         }
         user_can1.SetRxCallback(user_can1_rx_callback);
+        user_can1.SetRxCallback(my_rxcallback);
+
+
         LOG_INF("user_can1 ready");
     }
     return true;

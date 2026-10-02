@@ -1,0 +1,31 @@
+# modules/dbg —— 公共调参终端
+
+config DBG
+	bool "Tuning shell (RTT: pid ...)"
+	default n
+	select DUST_CTL_PID
+	select UART_INTERRUPT_DRIVEN
+	help
+	  通用调参终端：RTT 里收命令行，改**任何登记过的双环 PID**，不重新烧录即可整定。
+	  云台两条轴用的就是这套命令（底盘是单速度环，不登记）。
+
+	  业务侧只 include dbg.hpp（模块提供 include 路径），初始化时登记：
+	    dbg::RegisterPid({"gimbal", "yaw", &axis.position, &axis.omega});
+	  dbg 侧完全不认识业务类型；关掉本开关时登记调用编译成空操作，业务线程照常独立跑。
+
+	  命令：help / pid / pid <group> [<axis>] / pid <g> <a> in|out <kp> <ki> /
+	        pid <g> <a> mon <ms>
+
+	  输入口：RTT 下行缓冲（tools/rtt.sh + nc localhost 9090）；
+	          可选控制台串口 RX，见 DBG_UART_RX。
+
+config DBG_UART_RX
+	bool "Tuning shell also listens on the console UART RX"
+	default n
+	depends on DBG
+	help
+	  **默认关**：只从 RTT 下行缓冲收命令（在看日志的同一个窗口里敲即可）。
+
+	  打开后额外在 zephyr,console（dm_mc02 = usart3）上挂 RX 中断收命令。默认关是有意的：
+	  console 是日志口，往它上面挂 RX 中断等于和日志子系统共用一路串口的中断，台架上 RX
+	  悬空/有噪声时多一份不确定性；RTT 那条路已经够用，需要串口调参时再单独打开。

@@ -72,6 +72,14 @@ if(CONFIG_TRD_INTER_BUS)
 	)
 endif()
 
+if(CONFIG_TRD_VOFA)
+	target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vofa/trd_vofa.cpp)
+	target_include_directories(app PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}
+		${CMAKE_CURRENT_SOURCE_DIR}/vofa
+	)
+endif()
+
 if(CONFIG_TRD_IMU)
 	target_sources(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/imu/trd_imu.cpp)
 	target_include_directories(app PRIVATE

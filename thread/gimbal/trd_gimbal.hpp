@@ -30,9 +30,9 @@ namespace instance::gimbal
 
     // DM 电机 CAN ID：控制帧用 can_id 发出，反馈帧按 master_id 接收
     constexpr uint16_t kYawCanId      = 0x01;
-    constexpr uint16_t kYawMasterId   = 0x02;
+    constexpr uint16_t kYawMasterId   = 0x00;
     constexpr uint16_t kPitchCanId    = 0x02;
-    constexpr uint16_t kPitchMasterId = 0x01;
+    constexpr uint16_t kPitchMasterId = 0x11;
 
     /// 单轴：电机 + 双环 PID（外环角度 → 内环角速度 → 力矩）
     struct Axis {

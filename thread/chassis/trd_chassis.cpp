@@ -2,8 +2,8 @@
  * @file trd_chassis.cpp
  * @author qingyu
  * @brief 底盘控制线程 — 1ms 固定周期：指令 → 坐标变换 → 麦轮逆解 → 速度环 → 组帧
- * @version 0.3
- * @date 2026-09-15
+ * @version 0.4
+ * @date 2026-09-29
  *
  * ## 坐标系（右手系，z 轴向上）
  *
@@ -14,14 +14,23 @@
  *
  * 自转 ω 绕 z 轴，逆时针为正。
  *
+ * 上板指令的 y 轴正向是"车体右移"（遥控横移量的自然方向），与本坐标系相反，
+ * 因此在 ReadCommand 里读进来时就取反一次（见该处注释），之后
+ * 旋转 → 逆解 → 速度环 整条链路都统一在" +y = 左 "下计算。
+ *
  * ## 数据来源与所有权
  *
  * | 数据 | 通道 / 段 | 生产者 | 本线程的角色 |
  * |------|-----------|--------|--------------|
  * | 上板指令 | zbus `pub_from_head` | thread/inter_rx | 轮询读（状态通道无订阅者） |
  * | 云台相对角 | zbus `pub_gimbal_to` | 云台线程（尚未接入） | 轮询读，缺数据按 0 处理 |
- * | 电机反馈 | `.can_rx1` 段 | thread/can 的收帧分发 | 只注册 CAN_RX_HANDLER |
- * | 控制电流 | k_msgq `user_can1_msgq` | 本线程 | 入队，由 thread/can 发送 |
+ * | 电机反馈 | `.can_rx1` 段 | 本线程（总线所有者） | 只注册 CAN_RX_HANDLER |
+ * | 控制电流 | k_msgq `user_can1_msgq` | 本线程 | 入队后本线程外发 |
+ * | 波形输出 | VOFA+ JustFloat（别名 `vofa-uart`） | 本线程 | 每拍发被测轮 4 通道 |
+ *
+ * 总线所有权：user-can1 由本线程持有并初始化（Init + 收帧分发入口 + 外发），
+ * 与云台线程（can3）、inter_bus（can2）的约定一致。thread/can 只是单总线
+ * 收发测试线程，不参与本总线（Kconfig 里 TRD_CAN 与 TRD_CHASSIS 互斥）。
  *
  * ## 控制流
  *
@@ -31,20 +40,30 @@
  *         ↓
  *     UpdateTarget()      云台系 → 底盘系旋转 + 麦轮逆解 + 限幅
  *         ↓
- *     ControlCalculate()  单轮双环 PID（外环 ω → 内环 τ → 电流）
+ *     ControlCalculate()  单轮速度环 PID（ω → 目标电流）
  *         ↓
  *     FramePublish()      4 × int16 组帧 → CAN 发送队列
+ *         ↓
+ *     FlushTx()           队列 → user_can1.Send()（本线程是总线所有者）
+ *         ↓
+ *     VofaPublish()       被测轮 4 通道 → VOFA+（JustFloat，走 vofa-uart）
  *
- * ## 双环结构（每个电机一组）
+ * ## 单速度环结构（每个电机一组）
  *
- *     目标轮速 ω_ref ──→ ⊖ ──→ [外环 速度 PID] ──→ τ_ref ──→ ⊖ ──→ [内环 力矩 PID] ──→ /kTorqueK ──→ 电流
- *                       ↑                                  ↑
- *                    实测 ω                              实测 τ
+ *     目标轮速 ω_ref ──→ ⊖ ──→ [速度 PID] ──→ i_ref [A] ──→ ×kCurrentScale ──→ CAN 电流
+ *                       ↑
+ *                    实测 ω
  *
- *   外环输出是"力矩给定"（N·m），内环闭环在电调回传的实际电流（= 实测 τ）
- *   上，所以内环本质上就是电流环，只是用 kTorqueK 换了个单位；
- *   若想直接写成电流环：把内环反馈换成 GetNowCurrent()，增益与限幅同乘/同除
- *   kTorqueK 即可，控制器等价。
+ *   回路只有一环：反馈是输出轴轮速 ω（模块已按减速比折算，与目标同单位），
+ *   输出直接是"目标电流"（A），组帧时按 kCurrentScale 换成 C620 的原始值；
+ *   中间不再有内环/力矩量，电流限幅即 kCurrentMax。
+ *
+ * ## 整定（单速度环）
+ *
+ *   ① 看 VOFA+：ch0(ω_ref)/ch1(ω_meas) 调 kSpeedKp——边沿够快、又不过冲振铃为准，
+ *      再加一点 kSpeedKi 消静差（高频抖动/啸叫 = kp 过头）；
+ *   ② 同时看 ch2(i_ref)：被顶到 ±kCurrentMax 说明增益给得太猛（或负载太重），先降 kp；
+ *   ③ 整定完把数字抄回下面的 kSpeedKp/kSpeedKi，重编译烧录。
  *
  * ## 待实测参数（当前为占位值，实车测量后锁定）
  *
@@ -53,8 +72,7 @@
  * | `kWheelRadius` | 0.05 m | 轮半径（轮径 0.1m） |
  * | `kChassisR` | 0.135 m | 轮心到车体中心的等效自转半径 |
  * | `kWheelMix[][]` | ±√2/2 | 麦轮混控矩阵（含安装极性，方向不对只改这张表） |
- * | 外环（速度） | kp=1.0 / ki=0.02 | 输出 = 力矩给定，需按实车整定 |
- * | 内环（力矩） | kp=0.5 / ki=0.05 | 输出 / kTorqueK = 电流，需按实车整定 |
+ * | 速度环 | kp=3.3 / ki=0.07 | 输出 = 目标电流 A，需按实车整定 |
  *
  * @copyright Copyright (c) 2026
  */
@@ -67,9 +85,12 @@
 #include "thread.hpp"
 #include "Init_entry.hpp"
 #include "trd_chassis.hpp"
+#include "can.hpp"
+#include "vofa.hpp"
 
 #include <algorithm>
 #include <math.h>
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -90,6 +111,7 @@ namespace thread::chassis {
 using namespace instance::chassis;
 
 static Thread<2048> thread_ {};
+static Can user_can1 {};                 // user-can1 总线对象（本线程私有，本线程是总线所有者）
 
 // ==================== 机械（待实测） ====================
 static constexpr float kWheelRadius  = 1.0f;            // 轮半径 m（轮径 0.1m）
@@ -97,14 +119,24 @@ static constexpr float kChassisR     = 2.7f;           // 轮心到车体中心�
 static constexpr float kGearboxRatio = 3591.f / 187.f;   // M3508 + C620 减速比
 
 // ==================== 电气（C620 + M3508） ====================
-static constexpr float kTorqueK      = 0.3f;                     // 转矩常数 N·m/A
-static constexpr float kCurrentMax   = 20.0f;                    // 电调电流上限 A
+static constexpr float kTorqueK      = 0.3f;                     // 转矩常数 N·m/A（传给电机模块换算力矩，控制环不用）
+// 速度环输出的电流上限（电调量程仍是 ±20 A ↔ ±16384）：组帧前按 kCurrentMax 限一次，
+// 越界会整数回绕；kCurrentScale 把 A 换成 C620 的原始值。
+static constexpr float kCurrentMax   = 20.0f;
 static constexpr float kCurrentScale = 16384.0f / kCurrentMax;   // A → 原始值
-static constexpr float kTorqueMax    = kTorqueK * kCurrentMax;   // 力矩上限 N·m（= 内环/外环输出限幅）
+
+// ==================== PID 初值（手动整定） ====================
+// 上电/复位后的增益就是这两个数。台架上整定完把数字抄回这里，重新编译烧录。
+// 初值 ≈ 旧双环外环增益 / kTorqueK，等价起点：环形换了单位，物理行为与原来一致。
+static constexpr float kSpeedKp = 1.0f;              // 速度环 kp：轮速误差 → 目标电流 A
+static constexpr float kSpeedKi = 0.10f;             // 速度环 ki
+
+// VOFA+ 发哪一路（0~3 → CAN 0x201~0x204）。想看别的轮子改这个常量即可。
+static constexpr uint8_t kVofaWheel = 0;
 
 // ==================== 指令限幅与周期 ====================
 static constexpr float    kMaxMoveVelocity  = 10.0f;      // 平移线速度上限 m/s
-static constexpr float    kMaxRotationOmega = 2.0f;      // 自转角速度上限 rad/s
+static constexpr float    kMaxRotationOmega = 5.0f;      // 自转角速度上限 rad/s
 static constexpr float    kMaxWheelOmega    = 20.0f;     // 单轮输出轴角速度上限 rad/s（安全限）
 static constexpr uint32_t kPeriodMs         = 1;         // 控制周期
 static constexpr uint16_t kChassisTxId      = 0x200;     // 底盘控制帧 ID（4 × int16 电流）
@@ -117,7 +149,12 @@ static constexpr uint16_t kChassisTxId      = 0x200;     // 底盘控制帧 ID�
 //     ω_target[i] = v_wheel[i] / kWheelRadius                               [rad/s]
 //
 // 物理约束（实车校验用）：自转列对角反号、相邻同号；平移列按对角轮分成
-// (vx - vy) 与 (vx + vy) 两组。实车方向相反时只改这张表，不要改控制流。
+// (vx - vy) 与 (vx + vy) 两组。
+//
+// 方向不对时先分清是哪一类，别两处一起改：
+//   · 整体左右平移反了（前后、自转都正常）→ 不是安装问题，是上下板 y 轴约定，
+//     改 ReadCommand 里的 vy 取反那一处；
+//   · 单个轮子转反（直行跑偏、原地转变成平移）→ 才是这张表 / kMotorPolarity 的问题。
 static constexpr float kWheelMix[kMotorCount][3] = {
     { +kSqrt2_2, -kSqrt2_2, -kSqrt2_2 },   // 电机1（0x201）
     { +kSqrt2_2, +kSqrt2_2, -kSqrt2_2 },   // 电机2（0x202）
@@ -138,10 +175,16 @@ static bool  g_cmdOnline = false;               // 上板指令是否有效
 static float g_yawGimbal = 0.0f;                // 云台相对底盘偏航角 rad
 static bool  g_yawValid  = false;               // 是否收到过有效云台角
 static float g_wheelTarget[kMotorCount]  {};    // 各轮目标角速度 rad/s
-static float g_wheelCurrent[kMotorCount] {};    // 各轮 PID 输出电流 A（功率限制插入点）
+static float g_wheelCurrent[kMotorCount] {};    // 各轮速度环输出 = 目标电流 A（功率限制插入点）
 static uint32_t g_txDrop = 0;                   // 发送队列丢帧计数（诊断用）
 
+// 诊断 / VOFA+ 波形用的同帧快照（ControlCalculate 里从 ReadAll() 一次取齐）
+static float g_wheelOmegaMeas[kMotorCount]   {}; // 实测轮速 rad/s（输出轴）
+static float g_wheelCurrentMeas[kMotorCount] {}; // 实测电流 A
+
 static constexpr uint32_t kTxDropLogPeriod = 1000;   // 累计丢帧达到该值上报一次
+static constexpr uint8_t  kTxPerTickMax    = 4;      // 每拍最多外发帧数（1ms 内 4 × 8B ≈ 0.5ms 总线时间）
+static uint32_t g_txFail = 0;                        // CAN 发送失败计数（bus-off / 邮箱满时诊断用）
 
 
 /**
@@ -260,27 +303,44 @@ static void UpdateTarget()
 
         g_wheelTarget[i] = std::clamp(kMotorPolarity[i] * v_wheel / kWheelRadius,
                                       -kMaxWheelOmega, kMaxWheelOmega);
+
     }
 }
 
 /**
- * @brief 单轮双环 PID：外环轮速 → 内环力矩 → 电流
+ * @brief 单轮速度环 PID：轮速 → 目标电流
  *
- * 反馈统一取 ReadAll() 快照（模块内 seqlock 保护）：ω 与 τ 必须来自同一帧，
+ * 反馈统一取 ReadAll() 快照（模块内 seqlock 保护）：ω 与实测电流必须来自同一帧，
  * 分开调用两个 getter 有可能取到不同帧的数据。ω 是输出轴 rad/s（模块已按
  * 减速比折算），与目标同单位，不需要再乘/除减速比。
  */
 static void ControlCalculate()
 {
+    if (chassis_stop)
+    {
+        // 停机必须连"真正发出去的电流"一起清零：FramePublish() 组帧用的是
+        // g_wheelCurrent[]，不清零就 return 的话，电流会保持停机前最后一拍的
+        // 值（例如满量程 20 A），遥控器打 Stop 也停不下来。
+        for (auto &cur : g_wheelCurrent) {
+            cur = 0.0f;
+        }
+        for (auto &pid : chassis_motor_omega_pid) {
+            pid.SetIntegralError(0.0f);      // 解除停机时不要带着停机前的积分冲一下
+        }
+        return;
+    }
     for (uint8_t i = 0; i < kMotorCount; ++i)
     {
         const auto snap = chassis_motor[i].ReadAll();
 
-        // 外环：目标角速度 → 力矩给定
-        const float torque_ref = chassis_motor_omega_pid[i].Calc(g_wheelTarget[i], snap.omega);
+        // ω 与 i 来自同一帧快照，波形上两条曲线才对得上
+        g_wheelOmegaMeas[i]   = snap.omega;
+        g_wheelCurrentMeas[i] = snap.current;
 
-        // 内环：力矩给定 → 电流（电调收电流，故除以转矩常数）
-        g_wheelCurrent[i] = chassis_motor_torque_pid[i].Calc(torque_ref, snap.torque) / kTorqueK;
+        // 速度环：目标角速度 → 目标电流（电调收的就是电流，输出限幅在 kCurrentMax）
+        g_wheelCurrent[i] = chassis_motor_omega_pid[i].Calc(g_wheelTarget[i], snap.omega);
+
+        // g_wheelCurrent[i] = 0;   //测试用
     }
 
     // TODO(功率限制)：此处把 g_wheelCurrent[] 交给 alg::power_ctrl::PowerCtrl<kMotorCount>
@@ -288,7 +348,7 @@ static void ControlCalculate()
 }
 
 /**
- * @brief 组帧 → 投入 CAN 发送队列（消费者：thread/can 的发送线程）
+ * @brief 组帧 → 投入 CAN 发送队列（消费者：本线程的 FlushTx）
  *  此外，再发送数据到上板
  */
 static void FramePublish()
@@ -298,7 +358,7 @@ static void FramePublish()
 
     for (uint8_t i = 0; i < kMotorCount; ++i)
     {
-        // 电调只认 ±20A ↔ ±16384；越界会整数回绕 → 先限幅再换算
+        // 电调量程固定 ±20A ↔ ±16384，这里按 kCurrentMax 再限一次（越界会整数回绕）
         const float    amp = std::clamp(g_wheelCurrent[i], -kCurrentMax, kCurrentMax);
         const uint16_t raw = static_cast<uint16_t>(static_cast<int16_t>(amp * kCurrentScale));
 
@@ -307,11 +367,66 @@ static void FramePublish()
     }
 
     if (k_msgq_put(chassis_tx, &msg, K_NO_WAIT) != 0) {
-        // 发送线程来不及取帧（正常不会发生）：丢当前帧并计数，控制环不阻塞
+        // FlushTx 来不及取帧（正常不会发生）：丢当前帧并计数，控制环不阻塞
         if ((++g_txDrop % kTxDropLogPeriod) == 1u) {
             LOG_WRN("can tx queue full: %u frames dropped", static_cast<unsigned>(g_txDrop));
         }
     }
+}
+
+/**
+ * @brief 外发排在 user_can1_msgq 里的帧
+ *
+ * 本线程是 user-can1 总线所有者：总线对象、收帧分发入口、外发都在本线程内，
+ * 不再外包给别的线程。队列仍对外开放 —— 其它线程把帧 put 进来即可，
+ * 本线程每拍取走（每拍限量、Send 用 K_NO_WAIT，总线异常或队列堆积都不阻塞 1ms 控制环）。
+ */
+static void FlushTx()
+{
+    topic::to_can_tx::Message msg {};
+    uint8_t sent = 0;
+
+    while (sent < kTxPerTickMax && k_msgq_get(chassis_tx, &msg, K_NO_WAIT) == 0)
+    {
+        // 契约固定 8 字节载荷（不能用 sizeof(tx.data)：CAN FD 模式下是 64 字节）
+        can_frame tx {};
+        tx.id  = msg.tx_id;
+        tx.dlc = 8;
+        memcpy(tx.data, msg.data, sizeof(msg.data));
+
+        if (!user_can1.Send(&tx)) {
+            if ((++g_txFail % kTxDropLogPeriod) == 1u) {
+                LOG_WRN("can1 send fail id=0x%03x (total %u)",
+                        static_cast<unsigned>(msg.tx_id), static_cast<unsigned>(g_txFail));
+            }
+        }
+        ++sent;
+    }
+}
+
+/**
+ * @brief 把被测轮的一条曲线送到 VOFA+（JustFloat，4 通道）
+ *
+ * 通道固定 4 个，VOFA+ 里按 4 通道设，建议命名：
+ *   ch0 ω_ref  [rad/s] —— 速度环给定
+ *   ch1 ω_meas [rad/s] —— 实测轮速
+ *   ch2 i_ref  [A]     —— 速度环输出（目标电流）
+ *   ch3 i_meas [A]     —— 实测电流
+ *
+ * 调增益看 ch0/ch1，同时看 ch2(i_ref) 有没有被顶到 ±kCurrentMax。
+ * 每拍一帧 = 4×4B + 4B 帧尾 = 20B，1kHz ≈ 20kB/s（921600 波特率的 ~22%）；
+ * 上位机没接或缓冲满时 vofa::Send() 自己丢帧，不会阻塞 1ms 控制环。
+ */
+static void VofaPublish()
+{
+    const float frame[] = {
+        g_wheelTarget[kVofaWheel],
+        g_wheelOmegaMeas[kVofaWheel],
+        g_wheelCurrent[kVofaWheel],
+        g_wheelCurrentMeas[kVofaWheel],
+    };
+
+    vofa::Send(frame, sizeof(frame) / sizeof(frame[0]));
 }
 
 /**
@@ -325,12 +440,15 @@ static void Task(void*, void*, void*)
     for (;;)
     {
         const int64_t tick_start = k_uptime_ticks();
-        
+
         ReadCommand();
         ReadGimbalYaw();
         UpdateTarget();
+
         ControlCalculate();
         FramePublish();
+        FlushTx();
+        // VofaPublish();
 
         const int64_t period = k_ms_to_ticks_ceil64(kPeriodMs);
         const int64_t used   = k_uptime_ticks() - tick_start;
@@ -342,27 +460,37 @@ static void Task(void*, void*, void*)
 
 bool thread_init()
 {
+    // ---- user-can1：本线程是总线所有者 ----
+    // Init（注册过滤器 + can_start）与收帧分发入口全局只能设一次，
+    // 所以不再由 thread/can 代管：别的线程/组件不许再对本总线 Init()/SetRxCallback()。
+    {
+        const device *dev = DEVICE_DT_GET(DT_ALIAS(user_can1));
+        if (!device_is_ready(dev)) {
+            LOG_ERR("user_can1 not ready");
+            return false;
+        }
+
+        const can_filter filter { .id = 0, .mask = 0, .flags = 0 };   // 全收，按 ID 分发
+        if (!user_can1.Init(dev, filter)) {
+            // 总线起不来 = 电机收不到反馈、控制帧也发不出去，按初始化失败处理
+            LOG_ERR("user_can1 init fail");
+            return false;
+        }
+        user_can1.SetRxCallback(user_can1_rx_callback);
+        LOG_INF("user_can1 ready (%s)", dev->name);
+    }
+
     const float dt = static_cast<float>(kPeriodMs) / 1000.0f;        // 与控制周期一致
 
-    // 外环：轮速 → 力矩给定（输出限幅在物理力矩内）
-    alg::pid::Pid::Config omega_cfg {};
-    omega_cfg.kp      = 1.0f;                                       // 待整定
-    omega_cfg.ki      = 0.02f;                                      // 待整定
-    omega_cfg.kd      = 0.0f;
-    omega_cfg.iOutMax = kTorqueMax;
-    omega_cfg.outMax  = kTorqueMax;
-    omega_cfg.dt      = dt;
-    omega_cfg.dFirst  = alg::pid::DFirst::Enable;                   // 后续加 D 项时作用于测量值
-
-    // 内环：力矩 → 电流（输出再 / kTorqueK 得到 A）
-    alg::pid::Pid::Config torque_cfg {};
-    torque_cfg.kp      = 0.5f;                                      // 待整定
-    torque_cfg.ki      = 0.05f;                                     // 待整定
-    torque_cfg.kd      = 0.0f;
-    torque_cfg.iOutMax = kTorqueMax;
-    torque_cfg.outMax  = kTorqueMax;
-    torque_cfg.dt      = dt;
-    torque_cfg.dFirst  = alg::pid::DFirst::Enable;
+    // 速度环：轮速 → 目标电流（输出限幅在电调量程内）；增益初值见文件上方 kSpeed*
+    alg::pid::Pid::Config speed_cfg {};
+    speed_cfg.kp      = kSpeedKp;
+    speed_cfg.ki      = kSpeedKi;
+    speed_cfg.kd      = 0.0f;
+    speed_cfg.iOutMax = kCurrentMax;
+    speed_cfg.outMax  = kCurrentMax;
+    speed_cfg.dt      = dt;
+    speed_cfg.dFirst  = alg::pid::DFirst::Enable;                   // 后续加 D 项时作用于测量值
 
     for (uint8_t i = 0; i < kMotorCount; ++i)
     {
@@ -374,18 +502,17 @@ bool thread_init()
         motor_cfg.wheel_r       = 2.0f * kWheelRadius;
 
         chassis_motor[i].Init(motor_cfg);
-        chassis_motor_omega_pid[i].Init(omega_cfg);
-        chassis_motor_torque_pid[i].Init(torque_cfg);
+        chassis_motor_omega_pid[i].Init(speed_cfg);
     }
 
-    // 日志里不打印浮点：Zephyr log 的 cbprintf 默认不带 %f 支持
-    LOG_INF("chassis ready: %u wheels, rx 0x%03x-0x%03x, tx 0x%03x, %u ms, tauMax %u mN.m",
+    // 启动摘要只打整数，省得每次上电刷一屏浮点；实时波形走 VOFA+
+    LOG_INF("chassis ready: %u wheels, rx 0x%03x-0x%03x, tx 0x%03x, %u ms, iMax %u A",
             static_cast<unsigned>(kMotorCount),
             static_cast<unsigned>(kMotorRxId[0]),
             static_cast<unsigned>(kMotorRxId[kMotorCount - 1]),
             static_cast<unsigned>(kChassisTxId),
             static_cast<unsigned>(kPeriodMs),
-            static_cast<unsigned>(kTorqueMax * 1000.0f));
+            static_cast<unsigned>(kCurrentMax));
     return true;
 }
 

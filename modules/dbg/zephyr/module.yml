@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 工程自带的调参终端模块（modules/dbg，由根 CMakeLists.txt 的 ZEPHYR_EXTRA_MODULES 引入）。
+#
+#   dbg.hpp  —— 公共接口：用双环 PID 的业务线程 include 它，登记自己的内外环 PID；
+#   dbg.cpp  —— 命令行线程（RTT / 可选串口）：只认登记表，不认识任何业务类型。
+#
+# 没有上下游同名模块，所以用普通模块写法（cmake/kconfig 指向本目录）。
+name: dbg
+build:
+  cmake: .
+  kconfig: Kconfig

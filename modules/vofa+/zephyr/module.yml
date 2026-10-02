@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 工程自带的 VOFA+ 输出组件（modules/vofa+，用根 CMakeLists.txt 的
+# ZEPHYR_EXTRA_MODULES 引入）。
+#
+# 这里用普通模块写法（cmake/kconfig 指向本目录），不像 modules/segger 那样
+# cmake-ext —— segger 是为了复用 Zephyr 仓库里现成的胶水，而本模块自带
+# 全部源码与 Kconfig，没有上下游同名模块。
+name: vofa
+build:
+  cmake: .
+  kconfig: Kconfig
