@@ -23,6 +23,10 @@
 #include "pid.hpp"
 #include <cstdint>
 
+#if CONFIG_USE_POWERMETER
+#include "powermeter.hpp"
+#endif
+
 /// 底盘电机反馈所在 bus（user-can1）；本线程是总线所有者（Init + 收帧分发 + 外发）
 #define CHASSIS_RX_CAN USER_RX_CAN1
 
@@ -30,6 +34,11 @@ namespace instance::chassis
 {
     /// 控制帧去向：CAN 发送 topic（本线程入队后自己外发，队列对其它生产者同样开放）
     constexpr auto *chassis_tx = &user_can1_msgq;
+
+#if CONFIG_USE_POWERMETER
+    constexpr uint16_t kChassisPwrMeterId = 0x01;   ///< 功率计 CAN ID
+    inline PowerMeter  ChassisPwrMeter {};          ///< 实测功率（seqlock）
+#endif
 
     constexpr uint8_t  kMotorCount = 4;                                        ///< 轮数量
     constexpr uint16_t kMotorRxId[kMotorCount] = {0x201, 0x202, 0x203, 0x204}; ///< C620 反馈 ID
