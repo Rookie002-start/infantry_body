@@ -87,6 +87,7 @@
 #include "trd_chassis.hpp"
 #include "can.hpp"
 #include "vofa.hpp"
+#include "power_ctrl.hpp"
 
 #include <algorithm>
 #include <math.h>
@@ -113,6 +114,9 @@ using namespace instance::chassis;
 static Thread<2048> thread_ {};
 static Can user_can1 {};                 // user-can1 总线对象（本线程私有，本线程是总线所有者）
 
+// 功率控制器
+static alg::power_ctrl::PowerCtrl<kMotorCount> ChassisPwrCtrl {}; 
+
 // ==================== 机械（待实测） ====================
 static constexpr float kWheelRadius  = 1.0f;            // 轮半径 m（轮径 0.1m）
 static constexpr float kChassisR     = 2.7f;           // 轮心到车体中心等效自转半径 m
@@ -124,6 +128,23 @@ static constexpr float kTorqueK      = 0.3f;                     // 转矩常数
 // 越界会整数回绕；kCurrentScale 把 A 换成 C620 的原始值。
 static constexpr float kCurrentMax   = 20.0f;
 static constexpr float kCurrentScale = 16384.0f / kCurrentMax;   // A → 原始值
+
+// ==================== 功率限制（待实测锁定） ====================
+#if CONFIG_USE_POWERMETER
+static constexpr bool  kRlsEnable = true;                  // 有功率计 → 在线辨识
+#else
+static constexpr bool  kRlsEnable = false;                 // 无功率计 → 固定 K1/K2
+#endif
+static constexpr float kPowerBudget       = 45.0f;         // 总功率预算 W
+static constexpr float kPwrK1Init         = 1.453009e-07f; // K1 初值
+static constexpr float kPwrK2Init         = 5.171939e-03f; // K2 初值
+static constexpr float kPwrK3             = 3.0f;          // 单台电机固定损耗 W
+static constexpr float kPwrEta            = 1.0f;          // τ·ω 系数
+static constexpr float kPwrErrUpper       = 10.0f;         // 分配权重上阈值
+static constexpr float kPwrErrLower       = 0.05f;         // 分配权重下阈值
+#if CONFIG_USE_POWERMETER
+static constexpr float kPwrMeterMinBusVolt = 1.0f;         // 功率计在线判据 V
+#endif
 
 // ==================== PID 初值（手动整定） ====================
 // 上电/复位后的增益就是这两个数。台架上整定完把数字抄回这里，重新编译烧录。
@@ -141,20 +162,6 @@ static constexpr float    kMaxWheelOmega    = 20.0f;     // 单轮输出轴角�
 static constexpr uint32_t kPeriodMs         = 1;         // 控制周期
 static constexpr uint16_t kChassisTxId      = 0x200;     // 底盘控制帧 ID（4 × int16 电流）
 
-// ==================== 麦轮混控矩阵 ====================
-//
-// 行 = 电机（与 CAN 0x201~0x204 一一对应），列 = (vx, vy, 自转)：
-//
-//     v_wheel[i]  = mix[i][0]·vx + mix[i][1]·vy + mix[i][2]·(kChassisR·ω)   [m/s]
-//     ω_target[i] = v_wheel[i] / kWheelRadius                               [rad/s]
-//
-// 物理约束（实车校验用）：自转列对角反号、相邻同号；平移列按对角轮分成
-// (vx - vy) 与 (vx + vy) 两组。
-//
-// 方向不对时先分清是哪一类，别两处一起改：
-//   · 整体左右平移反了（前后、自转都正常）→ 不是安装问题，是上下板 y 轴约定，
-//     改 ReadCommand 里的 vy 取反那一处；
-//   · 单个轮子转反（直行跑偏、原地转变成平移）→ 才是这张表 / kMotorPolarity 的问题。
 static constexpr float kWheelMix[kMotorCount][3] = {
     { +kSqrt2_2, -kSqrt2_2, -kSqrt2_2 },   // 电机1（0x201）
     { +kSqrt2_2, +kSqrt2_2, -kSqrt2_2 },   // 电机2（0x202）
@@ -342,9 +349,46 @@ static void ControlCalculate()
 
         // g_wheelCurrent[i] = 0;   //测试用
     }
+}
 
-    // TODO(功率限制)：此处把 g_wheelCurrent[] 交给 alg::power_ctrl::PowerCtrl<kMotorCount>
-    // 预测 + 分配，再把限幅后的电流写回 g_wheelCurrent[]，之后才组帧。
+/**
+ * @brief 功率预测 + 分配：把速度环的目标电流限到功率预算内
+ *
+ * 喂数据 → 预测(+RLS) → 分配 → 写回 g_wheelCurrent[]，
+ * 必须在 ControlCalculate() 之后、FramePublish() 之前调用。
+ * τ/ω 取同帧实测值，误差现算（停机拍 PID 里是陈旧值）。
+ */
+static void PowerAllocate()
+{
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        const float tau = g_wheelCurrentMeas[i] * kTorqueK;   // 实测电流 → 转矩
+
+        ChassisPwrCtrl.SetMotorData(i, tau, g_wheelOmegaMeas[i],
+                                    g_wheelTarget[i] - g_wheelOmegaMeas[i]);
+        ChassisPwrCtrl.SetTarget(i, g_wheelCurrent[i]);       // PID 目标电流
+    }
+
+    // 功率计快照；掉线时总线电压为 0
+    bool meterOk = false;
+#if CONFIG_USE_POWERMETER
+    const auto pm = ChassisPwrMeter.ReadAll();
+    meterOk = (pm.bus_volt > kPwrMeterMinBusVolt);
+    if (meterOk) {
+        ChassisPwrCtrl.SetMeasuredPower(pm.power);
+    }
+#endif
+
+    // 掉线冻结辨识，沿用最后一次 K1/K2 开环预测
+    ChassisPwrCtrl.EnableRls(kRlsEnable && meterOk);
+
+    ChassisPwrCtrl.Predict();
+    ChassisPwrCtrl.Allocate(kPowerBudget);
+
+    for (uint8_t i = 0; i < kMotorCount; ++i)
+    {
+        g_wheelCurrent[i] = ChassisPwrCtrl.GetLimitedCurrent(i);
+    }
 }
 
 /**
@@ -405,25 +449,26 @@ static void FlushTx()
 }
 
 /**
- * @brief 把被测轮的一条曲线送到 VOFA+（JustFloat，4 通道）
+ * @brief 把被测轮的一条曲线送到 VOFA+（JustFloat，最多16个通道）
  *
- * 通道固定 4 个，VOFA+ 里按 4 通道设，建议命名：
- *   ch0 ω_ref  [rad/s] —— 速度环给定
- *   ch1 ω_meas [rad/s] —— 实测轮速
- *   ch2 i_ref  [A]     —— 速度环输出（目标电流）
- *   ch3 i_meas [A]     —— 实测电流
- *
- * 调增益看 ch0/ch1，同时看 ch2(i_ref) 有没有被顶到 ±kCurrentMax。
- * 每拍一帧 = 4×4B + 4B 帧尾 = 20B，1kHz ≈ 20kB/s（921600 波特率的 ~22%）；
- * 上位机没接或缓冲满时 vofa::Send() 自己丢帧，不会阻塞 1ms 控制环。
  */
-static void VofaPublish()
+[[maybe_unused]] static void VofaPublish()
 {
+    // 前 4 路：速度环整定；后 4 路：功率模型整定
+    float meterPower = 0.0f;
+#if CONFIG_USE_POWERMETER
+    meterPower = ChassisPwrMeter.GetPower();
+#endif
+
     const float frame[] = {
         g_wheelTarget[kVofaWheel],
         g_wheelOmegaMeas[kVofaWheel],
         g_wheelCurrent[kVofaWheel],
         g_wheelCurrentMeas[kVofaWheel],
+        ChassisPwrCtrl.GetTotalPower(),
+        meterPower,
+        ChassisPwrCtrl.GetK1(),
+        ChassisPwrCtrl.GetK2(),
     };
 
     vofa::Send(frame, sizeof(frame) / sizeof(frame[0]));
@@ -446,6 +491,7 @@ static void Task(void*, void*, void*)
         UpdateTarget();
 
         ControlCalculate();
+        PowerAllocate();
         FramePublish();
         FlushTx();
         // VofaPublish();
@@ -505,6 +551,25 @@ bool thread_init()
         chassis_motor_omega_pid[i].Init(speed_cfg);
     }
 
+    // ---- 功率限制：模型参数 + （可选）功率计 ----
+    {
+        alg::power_ctrl::PowerCtrl<kMotorCount>::Config cfg {};
+        cfg.torqueK        = kTorqueK;      // 与电机模块同一 Kt
+        cfg.k1Init         = kPwrK1Init;
+        cfg.k2Init         = kPwrK2Init;
+        cfg.k3             = kPwrK3;
+        cfg.etaInit        = kPwrEta;
+        cfg.errUpper       = kPwrErrUpper;
+        cfg.errLower       = kPwrErrLower;
+        cfg.rlsLambda      = 0.999f;        // 1ms 调用一次
+        cfg.rlsEnable      = kRlsEnable;
+        cfg.tauOmegaEnable = true;          // 保留 τ·ω 项
+        ChassisPwrCtrl.Init(cfg);
+    }
+#if CONFIG_USE_POWERMETER
+    ChassisPwrMeter.Init(kChassisPwrMeterId);
+#endif
+
     // 启动摘要只打整数，省得每次上电刷一屏浮点；实时波形走 VOFA+
     LOG_INF("chassis ready: %u wheels, rx 0x%03x-0x%03x, tx 0x%03x, %u ms, iMax %u A",
             static_cast<unsigned>(kMotorCount),
@@ -513,6 +578,8 @@ bool thread_init()
             static_cast<unsigned>(kChassisTxId),
             static_cast<unsigned>(kPeriodMs),
             static_cast<unsigned>(kCurrentMax));
+    LOG_INF("power limit: budget %u W, RLS %s", static_cast<unsigned>(kPowerBudget),
+            kRlsEnable ? "on" : "off");
     return true;
 }
 
@@ -527,6 +594,12 @@ CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x201, [](uint8_t *data) { chassis_motor[0].CanCp
 CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x202, [](uint8_t *data) { chassis_motor[1].CanCpltRxCallback(data); }, motor2);
 CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x203, [](uint8_t *data) { chassis_motor[2].CanCpltRxCallback(data); }, motor3);
 CAN_RX_HANDLER(CHASSIS_RX_CAN, 0x204, [](uint8_t *data) { chassis_motor[3].CanCpltRxCallback(data); }, motor4);
+
+// 功率计（与电机同总线；未开启时整体编译掉）
+#if CONFIG_USE_POWERMETER
+CAN_RX_HANDLER(CHASSIS_RX_CAN, kChassisPwrMeterId,
+               [](uint8_t *data) { ChassisPwrMeter.CanCpltRxCallback(data); }, pwr_meter);
+#endif
 
 REGISTER_INIT  (thread_init,  MidInit,   Mid, "chassis_init");
 REGISTER_THREAD(thread_start, MidThread, Mid, "chassis_start");

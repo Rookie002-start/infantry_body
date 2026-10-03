@@ -63,6 +63,7 @@ config TRD_CHASSIS
     select DUST_TPC_TO_CAN_TX
     select DUST_TPC_FROM_HEAD
     select DUST_TPC_GIMBAL_TO
+    select DUST_MOD_CTL_POWER
     select INTER_CMD
     help
       底盘控制线程（thread/chassis/trd_chassis.cpp）：1ms 周期
@@ -70,6 +71,16 @@ config TRD_CHASSIS
       本线程是 user-can1 总线的所有者：Init + SetRxCallback（电机反馈 → .can_rx1）
       + 外发控制帧，所以不再 select TRD_CAN（那个只是单总线测试线程）。
       设备树依赖：别名 user-can1，见 boards/*/*.overlay。
+
+config USE_POWERMETER
+    bool "Chassis power meter (Horizon, user-can1 / 0x01)"
+    depends on TRD_CHASSIS
+    default n
+    select DUST_MOD_DEV_POWERMETER
+    help
+      底盘功率计（user-can1，ID 见 trd_chassis.hpp）。
+      打开：实测功率进 RLS 在线辨识 K1/K2，掉线自动冻结辨识。
+      关掉：不注册回调，按固定 K1/K2 开环预测。功率限幅本身一直生效。
 
 config TRD_GIMBAL
     bool "Gimbal control thread"
