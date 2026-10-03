@@ -15,6 +15,7 @@ static void Task(void*, void*, void*)
     float tx[] = {0.1, 0.2, 0.3};
     for (;;)
     {
+        printk("test\r\n");
         vofa::Send(tx, sizeof(tx) / sizeof(tx[0]));
         k_msleep(100);
     }
